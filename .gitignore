@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cython / C extension build artifacts
+# (generated from simulator.pyx via build_cython.py — keep the .pyx/.pxd sources)
+*.so
+*.o
+*.a
+simulator.c
+build/
+*.egg-info/
+.eggs/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
