@@ -37,6 +37,7 @@ import torch
 
 from .config import DTYPE
 from .potential import SplinePotential
+from .photophysics import EffectiveRates
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +349,27 @@ def _fill_invalid(vals: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     idx = np.arange(v.size)
     v[~m] = np.interp(idx[~m], idx[m], v[m])
     return torch.as_tensor(v, dtype=DTYPE, device=vals.device)
+
+
+def estimate_rates(batch, *, bg_frac=0.10, bg_g=None, bg_r=None, device=None):
+    """Rough data-driven initial EffectiveRates (a_g, a_r, bg_g, bg_r) from a photon Batch.
+
+    Emission model: mu_G(x)=a_g·f_g(x)+bg_g, mu_R(x)=a_r·f_r(x)+bg_r (kHz). Only the per-channel
+    TOTAL rate is observable from a photon stream, so this is a STARTING point for fit_rates=True:
+      a_g = total green-channel rate, a_r = total red-channel rate (pooled over traces),
+      bg_g/bg_r = bg_frac · the corresponding channel rate.
+    Pass bg_g/bg_r (kHz) if you have calibrated backgrounds. Returns float64 tensors on `device`.
+    """
+    dev = device if device is not None else batch.ipt.device
+    mask = batch.mask
+    n_ph = float(mask.sum())                        # total photons
+    total_T = float(batch.T.sum())                  # total observation time (ms)
+    rate = n_ph / max(total_T, 1e-9)                # overall photon rate (kHz)
+    n_red = float((batch.colors * mask).sum())      # red photons (color == 1)
+    frac_red = n_red / max(n_ph, 1.0)
+    a_g_val = rate * (1.0 - frac_red)               # total green channel rate
+    a_r_val = rate * frac_red                       # total red channel rate
+    bg_g_val = bg_frac * a_g_val if bg_g is None else float(bg_g)
+    bg_r_val = bg_frac * a_r_val if bg_r is None else float(bg_r)
+    t = lambda v: torch.tensor(float(v), dtype=torch.float64, device=dev)
+    return EffectiveRates(t(a_g_val), t(a_r_val), t(bg_g_val), t(bg_r_val))

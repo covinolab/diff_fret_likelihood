@@ -7,6 +7,71 @@ cimport numpy as cnp
 
 cnp.import_array()
 
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+cdef double draw_boltzmann_x0(
+        gsl_utils.gsl_spline *spline,
+        gsl_utils.gsl_interp_accel *acc,
+        gsl_utils.gsl_rng *rng,
+        cnp.ndarray[double] x_knots,
+        int N_grid=2000,
+        ):
+    """
+    One draw from the equilibrium distribution of the spline potential,
+        p_eq(x) ∝ exp(-U(x)),   kT = 1,
+    where U is the *value* of `spline` (the main loop uses its derivative).
+
+    Support is the spline's own domain [x_knots[0], x_knots[-1]] — that is
+    where U is defined; GSL errors outside it and the integrator aborts a
+    trajectory that leaves it. So this *is* the Boltzmann distribution for
+    this potential, not a range imposed on it.
+
+    Inverse-CDF via trapezoid integration, no heap allocation.
+    """
+    cdef int j, N = x_knots.shape[0]
+    cdef double x_lo = x_knots[0]
+    cdef double dx = (x_knots[N - 1] - x_lo) / (N_grid - 1)
+    cdef double Ug, Umin, Z = 0.0, u_draw
+    cdef double c_prev, c_curr = 0.0, w_prev, w_curr, frac
+
+    # min of U (log-sum-exp shift so exp() stays finite in deep wells)
+    gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Umin)
+    for j in range(1, N_grid):
+        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        if Ug < Umin:
+            Umin = Ug
+
+    # total mass Z = ∫ exp(-(U - Umin)) dx
+    gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Ug)
+    w_prev = exp(-(Ug - Umin))
+    for j in range(1, N_grid):
+        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        w_curr = exp(-(Ug - Umin))
+        Z += 0.5 * (w_prev + w_curr) * dx
+        w_prev = w_curr
+
+    # invert the CDF at u ~ Uniform(0, Z)
+    u_draw = gsl_utils.gsl_rng_uniform(rng) * Z
+    gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Ug)
+    w_prev = exp(-(Ug - Umin))
+    for j in range(1, N_grid):
+        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        w_curr = exp(-(Ug - Umin))
+        c_prev = c_curr
+        c_curr += 0.5 * (w_prev + w_curr) * dx
+        if c_curr >= u_draw:
+            if c_curr > c_prev:
+                frac = (u_draw - c_prev) / (c_curr - c_prev)
+            else:
+                frac = 0.0
+            return x_lo + (j - 1 + frac) * dx
+        w_prev = w_curr
+
+    return x_knots[N - 1]
+
+
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def eval_spline(
@@ -82,7 +147,6 @@ def eval_spline(
 @cython.wraparound(False)
 @cython.cdivision(True)
 def smFRET_simulator(
-        double x0,
         double Dx,
         cnp.ndarray[double] x_knots,
         cnp.ndarray[double] y_knots,
@@ -175,11 +239,12 @@ def smFRET_simulator(
     cdef double R0_6 = pow(R0, 6.0)
 
     # State variables
-    cdef double xold = x0 # Ideally this should be drawn from the equilibrium distribution, but we start at x0 for simplicity.
+    cdef double xold = draw_boltzmann_x0(spline, acc, rng, x_knots)
     cdef double xnew, Fx, spline_val
     cdef double r, r_6, E, phi_g, phi_r, lambda_g, lambda_r
     cdef unsigned int n_g, n_r, k_emit
     cdef int status = 0
+    cdef bint budget_exceeded = False   # must init: read at return even if never tripped
 
     # Output arrays: per-photon arrival times (variable length, capped at N_max_photons).
     cdef cnp.ndarray[double] G_times = np.empty(N_max_photons, dtype=np.double)
@@ -195,7 +260,7 @@ def smFRET_simulator(
         if status != 0:
             break
 
-        Fx = spline_val
+        Fx = -spline_val
 
         # Langevin integration step
         xnew = xold + Ax * Fx + Bx * gsl_utils.gsl_ran_gaussian_ziggurat(rng, 1.0)

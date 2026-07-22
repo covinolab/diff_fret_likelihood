@@ -26,9 +26,22 @@ from typing import Sequence
 
 import torch
 
-# Non-negotiable: the eigendecomposition + log-normalizers need float64
-# (SPEC section 8).  Keep this the single source of truth.
+# The likelihood is designed for double precision: the eigendecomposition +
+# log-normalizers need float64 (SPEC section 8).  Keep this the single source of
+# truth for the intended dtype.
 DTYPE = torch.float64
+
+
+def use_float64() -> None:
+    """Set torch's global default dtype to float64 (the dtype the likelihood is
+    designed for).
+
+    Importing ``diff_fret_likelihood`` does **not** mutate global torch state;
+    call this once (before building configs / running a fit) if you want tensors
+    created without an explicit dtype to default to float64. The test suite sets
+    this in ``tests/conftest.py``.
+    """
+    torch.set_default_dtype(DTYPE)
 
 
 @dataclass
@@ -124,12 +137,21 @@ class PriorConfig:
     objective is byte-for-byte unchanged unless the GP is explicitly switched on.
     Recommendation: use the GP as the SINGLE shape prior (``curvature_weight=0``);
     don't stack two strong smoothness priors.
+
+    Each term is toggled by a sentinel (weight ``0`` or ``None``).  ``PriorConfig()``
+    is prior-free by default (``curvature_weight=0.0``, all terms off) -- equivalent to
+    pure MLE; switch on the terms you want, or pass ``prior=None`` to ``fit`` /
+    ``neg_log_posterior`` (or use ``PriorConfig.none()`` when an instance is required)
+    for an explicit MLE.  ``active_terms()`` / ``describe()`` report which terms are on.
     """
 
-    curvature_weight: float = 0.05  # rho * integral (u'')^2 dx  (grid-invariant units)
-    logD_mean: float | None = None  # weak Gaussian prior on log D (None -> off)
+    # --- landscape roughness (improper thin-plate; scaled by this weight) ---
+    curvature_weight: float = 0.0  # rho * integral (u'')^2 dx  (grid-invariant units)
+    # --- weak Gaussian prior on log D (logD_mean=None -> off) ---
+    logD_mean: float | None = None
     logD_std: float = 1.0
-    l2_weight: float = 0.0  # optional weak L2 on potential params
+    # --- optional weak L2 on potential params (0 -> off) ---
+    l2_weight: float = 0.0
     # --- proper GP prior over U(x) (None sigma -> OFF; fully backward-compatible) ---
     gp_sigma: float | None = None      # marginal SD (kT); None DISABLES the GP prior
     gp_lengthscale: float = 1.0        # correlation length (nm)
@@ -138,7 +160,17 @@ class PriorConfig:
     gp_mean: "torch.Tensor | None" = None  # [G] on the grid; interp'd to x_ctrl; None -> 0
     gp_jitter: float = 1e-6            # relative to the correlation matrix (FIXED)
 
+    max_entropy_weight: float = 0.0  # weight for the max-entropy penalty (D * sum w du^2 / h^2)
+
     def __post_init__(self):
+        if self.curvature_weight < 0:
+            raise ValueError(
+                f"curvature_weight must be >= 0, got {self.curvature_weight}"
+            )
+        if self.logD_std <= 0:
+            raise ValueError(f"logD_std must be > 0, got {self.logD_std}")
+        if self.l2_weight < 0:
+            raise ValueError(f"l2_weight must be >= 0, got {self.l2_weight}")
         if self.gp_sigma is not None:
             if self.gp_sigma <= 0:
                 raise ValueError(f"gp_sigma must be > 0, got {self.gp_sigma}")
@@ -151,25 +183,43 @@ class PriorConfig:
                     f"gp_kernel must be rbf|matern32|matern52, got {self.gp_kernel!r}"
                 )
 
+    @classmethod
+    def none(cls) -> "PriorConfig":
+        """A fully prior-free config (pure MLE): every term disabled.
+
+        Numerically equivalent to passing ``prior=None`` to ``fit`` /
+        ``neg_log_posterior``; provided for callers that need a ``PriorConfig``
+        instance rather than ``None``.
+        """
+        return cls(curvature_weight=0.0, logD_mean=None, l2_weight=0.0, gp_sigma=None)
+
+    def active_terms(self) -> list[str]:
+        """Names of the prior terms currently switched on (empty -> pure MLE)."""
+        terms: list[str] = []
+        if self.curvature_weight:
+            terms.append("curvature")
+        if self.logD_mean is not None:
+            terms.append("logD")
+        if self.gp_sigma is not None:
+            terms.append("gp")
+        if self.l2_weight:
+            terms.append("l2")
+        return terms
+
+    def describe(self) -> str:
+        """Human-readable summary of which priors are active."""
+        active = self.active_terms()
+        return "MLE (no prior)" if not active else "MAP prior: " + ", ".join(active)
+
 
 @dataclass
 class OptimConfig:
     """Adam warmup -> LBFGS polish (SPEC section 7.6)."""
 
-    adam_steps: int = 10
-    adam_lr: float = 0.02
-    lbfgs_steps: int = 0
-    lbfgs_lr: float = 0.5
-    grad_clip: float = 10.0
+    adam_steps: int = 300
+    adam_lr: float = 0.03
+    grad_clip: float = 1.0
     log_every: int = 25
-    # torch.compile the photon recursion (fusion win, numerically transparent --
-    # see tests/test_compile.py).  ``compile=False`` -> eager.  Default mode is
-    # inductor "default" (fast, robust ~1.1x); "reduce-overhead" (CUDA-graphs)
-    # gives negligible extra here -- the recursion is fp64-compute-bound, not
-    # launch-bound -- and compiles very slowly over long photon streams.
     compile: bool = False
     compile_mode: str = "default"
-    # Mixed-precision recursion (fp32 matmuls, fp64 log-normaliser) -- large GPU
-    # win where fp64 is throttled; accuracy-gated (tests/test_fp32.py). None ->
-    # full float64.  Set to ``torch.float32`` to enable.
     propagate_dtype: "torch.dtype | None" = None

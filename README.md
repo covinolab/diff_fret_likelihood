@@ -73,18 +73,53 @@ throughout). See `forward.py` for the derivation in the module docstring.
 | `infer.py` | `fit`: Adam→LBFGS MAP; `recovered_potential`, `posterior_occupancy` diagnostics |
 | `sample.py` | **HMC/NUTS posterior sampling** (pyro) of `U(x)`, `D`, rates; single- and multi-chain (R-hat/ESS) |
 | `init.py` | data-driven / external warm-starts: histogram landscape `u≈-log π̂`, `D` from autocorrelation, profile fitting |
-| `simulate.py` | thin adapter around the `smFRET_sbi` Cython simulator; ground-truth landscape/rates |
+| `simulate.py` | thin wrapper around the in-project Cython `simulator` (GSL); parallel equilibrium trace generation |
 | `utils.py` | seeding, positivity transforms, log-space helpers |
+
+## Installation
+
+Installed from source; the Cython simulator is compiled locally.
+
+**System prerequisite — GSL.** The simulator links the GNU Scientific Library,
+which is *not* pip-installable. Install it first:
+
+```
+Debian/Ubuntu : sudo apt-get install libgsl-dev pkg-config
+Fedora/RHEL   : sudo dnf install gsl-devel pkgconf-pkg-config
+conda-forge   : conda install -c conda-forge gsl pkg-config
+macOS (brew)  : brew install gsl pkg-config
+```
+
+If GSL lives in a non-standard location, set `GSL_DIR=/path/to/gsl`.
+
+**Prerequisite — PyTorch.** Install the build matching your platform (CPU or a
+specific CUDA version) from <https://pytorch.org> *before* installing this
+package — torch is deliberately not pinned as a dependency. Requires `torch >= 2.1`.
+
+**Install:**
+
+```bash
+pip install .                          # portable build
+DFL_NATIVE=1 pip install .             # CPU-specific fast-math build (faster, non-portable)
+pip install -e . --no-build-isolation  # editable dev install (builds against your numpy)
+```
+
+Optional extras: `pip install ".[sampling]"` (pyro HMC/NUTS),
+`".[diagnostics]"` (arviz R-hat/ESS), `".[dev]"` (pytest + all optionals).
+
+> If you hit a numpy ABI error at import, reinstall with `--no-build-isolation`
+> so the extension builds against your installed numpy.
 
 ## Requirements
 
-* Python 3.10 (`~/Venvs/fret_sbi`), `torch`, `numpy`, `scipy`
-* `omegaconf` — for `simulate.py` (reads the simulator configs)
-* `pyro-ppl` — for `sample.py` (HMC/NUTS)
+* Python ≥ 3.10, `torch >= 2.1` (prerequisite, see above), `numpy`, `scipy`
+* `pyro-ppl` — optional, for `sample.py` (HMC/NUTS)
 * `arviz` — optional, for R-hat / ESS diagnostics on posterior chains
 
-Importing the package sets `torch.set_default_dtype(torch.float64)`: float64 in
-the likelihood path is non-negotiable (the `eigh` + log-normalisers need it).
+**float64.** Importing the package does **not** change global torch state. The
+likelihood is designed for double precision (the `eigh` + log-normalisers need
+it), so call `dfl.use_float64()` once before building configs / running a fit, or
+pass `dtype=dfl.DTYPE` explicitly. (The test suite sets this in `conftest.py`.)
 
 ## Quick start — MAP fit
 
@@ -176,7 +211,7 @@ the fit refines.
 
 ## Priors
 
-`PriorConfig` (see `objective.py`):
+`PriorConfig` (defined in `config.py`; evaluated by `objective.prior_penalty`):
 
 * `curvature_weight` — grid-invariant roughness `≈ ∫ (u'')² dx` (improper
   thin-plate limit; good for MAP).
@@ -187,6 +222,25 @@ the fit refines.
   don't stack two strong smoothness priors.
 * `logD_mean` / `logD_std` — optional weak Gaussian prior on `log D`.
 * `l2_weight` — optional weak L2 on the potential parameters.
+
+The prior enters the objective in exactly one place, `objective.prior_penalty`, so
+`neg_log_posterior = -loglik + prior_penalty(...)`. Each term is toggled by a
+sentinel (weight `0` or `None`), and `PriorConfig()` is **prior-free by default**
+(`curvature_weight=0.0`, all terms off) — switch on the terms you want. Inspect
+which terms are on with `prior.active_terms()` / `prior.describe()`.
+
+**True MLE.** Pass `prior=None` to `fit` / `neg_log_posterior` for a pure
+maximum-likelihood fit (no regularisation; `prior_penalty` returns `0`), or use
+`PriorConfig.none()` where a `PriorConfig` instance is required:
+
+```python
+res_mle = fit(batch, grid, pot, C, R0, D_init=D0, rates_init=rates, prior=None)
+res_map = fit(batch, grid, pot, C, R0, D_init=D0, rates_init=rates,
+              prior=PriorConfig(curvature_weight=0.05))
+```
+
+`prior=None` is only for point estimation; HMC sampling (`sample_posterior`)
+requires a proper prior (`gp_sigma` set) and raises on `None`.
 
 ## Performance knobs
 
@@ -213,7 +267,7 @@ on the steep landscapes HMC transiently proposes — gradients still flow.
 ## Tests
 
 ```bash
-~/Venvs/fret_sbi/bin/python -m pytest diff_fret_likelihood/tests -q
+python -m pytest tests -q
 ```
 
 Gates: force `= -∇u` (gradcheck) and gauge invariance (`test_potential`);
@@ -243,8 +297,5 @@ score-at-truth** validation of the equilibrium likelihood (`test_bartlett_fisher
 
 ## See also
 
-* `../diff_fret_likelihood_recovery.ipynb` — full equilibrium + binding recovery
-  study.
-* `../diff_fret_likelihood_real_data.ipynb` — real experimental photon streams.
-* `../benchmark/` — the calibration / MAP-recovery / score-test / Fisher harness
-  (`phase_a`, `map_recovery`, `score_test`, `fisher_data_requirement`, `report`).
+* A self-contained example notebook (equilibrium recovery + inference
+  walkthrough) accompanies this package.

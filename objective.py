@@ -1,6 +1,7 @@
 """Objectives, priors and regularisers.
 
 * ``curvature_penalty`` -- discrete-curvature smoothness prior on ``u`` (SPEC 9).
+* ``prior_penalty`` -- the single aggregated ``-log prior`` term (``None`` -> MLE).
 * ``neg_log_posterior`` -- marginal-likelihood-based training objective.
 * ``complete_data_loglik`` -- SECONDARY joint objective with the path as a
   latent variable (SPEC 4.5), used for the joint-vs-marginal D-bias diagnostic.
@@ -11,6 +12,8 @@ from __future__ import annotations
 import math
 
 import torch
+
+from . import potential as dfl_potential
 
 from .config import PriorConfig
 from .dynamics import em_transition_logp
@@ -34,6 +37,23 @@ def curvature_penalty(u_grid: torch.Tensor, dx: float = 1.0) -> torch.Tensor:
     return (d2 ** 2).sum() / (dx ** 3)
 
 
+def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor) -> torch.Tensor:
+    """Roughness of the *knot heights* — the actual free params.
+    Second difference on (possibly non-uniform) knots ~ theta'' at each interior knot.
+    This is D2 @ theta; the penalty is ||D2 @ theta||^2 = theta^T (D2^T D2) theta,
+    i.e. a GMRF prior with precision rho * D2^T D2. Grid-independent by construction:
+    it never touches the fine grid, only the K knots that carry the DOF.
+    """
+    x = knots_x
+    h_left  = x[1:-1] - x[:-2]      # (K-2,)
+    h_right = x[2:]   - x[1:-1]
+    # non-uniform 2nd-difference: theta''_i ~ 2/(hl+hr) * (theta_{i+1}/hr - theta_i(1/hl+1/hr) + theta_{i-1}/hl)
+    d2 = 2.0 * ( theta[2:]   / (h_right * (h_left + h_right))
+               - theta[1:-1] / (h_left * h_right)
+               + theta[:-2]  / (h_left  * (h_left + h_right)) )
+    return (d2 ** 2).sum()
+
+
 def logD_penalty(D: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
     if prior.logD_mean is None:
         return torch.zeros((), dtype=D.dtype, device=D.device)
@@ -41,10 +61,6 @@ def logD_penalty(D: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
     return 0.5 * ((logD - prior.logD_mean) / prior.logD_std) ** 2
 
 
-# ---------------------------------------------------------------------------
-# Proper GP prior over U(x)  (SPEC section 9; makes the landscape posterior
-# proper -- essential for HMC sampling, see sample.py)
-# ---------------------------------------------------------------------------
 def _gp_corr(x_ctrl: torch.Tensor, lengthscale: float, kernel: str) -> torch.Tensor:
     """Stationary correlation matrix ``[n,n]`` on control points (unit variance)."""
     r = (x_ctrl[:, None] - x_ctrl[None, :]).abs() / lengthscale
@@ -117,73 +133,99 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     return 0.5 * (z.squeeze(-1) @ z.squeeze(-1)) / (prior.gp_sigma ** 2)
 
 
-def neg_log_posterior(
-    ipt, colors, mask, potential, D, rates, grid, C, R0, prior: PriorConfig,
-    p0=None, compile_mode=None, propagate_dtype=None,
-) -> torch.Tensor:
-    """``-loglik + regularisers`` (marginal-based).  Scalar tensor.
+def max_entropy_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
+    u = potential(grid)
+    h = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
+    pi  = torch.softmax(-u, 0)             # stationary mass, sums to 1
+    du  = u[1:] - u[:-1]                   # (G-1,) edge drops
+    w   = torch.sqrt(pi[1:] * pi[:-1])     # geometric-mean edge weight
+    max_entropy_penalty   = D * (w * du**2).sum() / h**2 
 
-    The curvature and ``logD`` priors act on ``u_grid``/``D`` only.
-    ``compile_mode`` / ``propagate_dtype`` are forwarded to
-    ``marginal_loglik_batch`` (defaults -> eager float64).
+    if prior.max_entropy_weight:
+        return max_entropy_penalty * prior.max_entropy_weight
+
+
+def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
+    """The pure-gauge offset coordinate of ``U`` (the exact flat likelihood direction).
+
+    The marginal likelihood is exactly invariant to ``U -> U + const``.  For a
+    ``SplinePotential`` (natural cubic, ``u = M_val @ theta`` with ``M_val`` a
+    partition of unity) that flat direction is ``(1,...,1)`` in ``theta``-space, so
+    ``mean(theta)`` is the offset whose gradient points *exactly* along it -- anchoring
+    it therefore pins the gauge with ZERO bias on the identified shape (well depths,
+    barriers, ``D``).  For the MLP (no knots) we fall back to ``mean(U over grid)``.
     """
-    ll = marginal_loglik_batch(
-        ipt, colors, mask, potential, D, rates, grid, C, R0, p0=p0,
-        compile_mode=compile_mode, propagate_dtype=propagate_dtype,
-    )
-    u_grid = _BasePotential_on_grid(potential, grid)
-    dx = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
-    reg = prior.curvature_weight * curvature_penalty(u_grid, dx)
-    reg = reg + logD_penalty(D, prior)
+    if hasattr(potential, "theta"):          # spline: exact flat direction
+        return potential.theta.mean()
+    return potential.on_grid(grid).mean()     # MLP fallback
+
+
+def gauge_penalty_from_offset(offset: torch.Tensor, gauge_sd: float = 1.0) -> torch.Tensor:
+    """Gaussian anchor ``0.5 (offset / gauge_sd)^2`` on the pure-gauge offset."""
+    return 0.5 * (offset / gauge_sd) ** 2
+
+
+def gauge_penalty(potential, grid: torch.Tensor, gauge_sd: float = 1.0) -> torch.Tensor:
+    """Anchor the pure-gauge offset of ``U`` toward zero (``mean(theta)=0`` gauge).
+
+    Added to the *fit* objective only (see ``infer.fit``) so the otherwise-flat offset
+    direction has a defined gradient/curvature and converges reproducibly, without
+    biasing any identified quantity.  Kept OUT of ``prior_penalty``/``neg_log_posterior``
+    so the sampler (which adds its own gauge anchor) does not double-count it.
+    """
+    return gauge_penalty_from_offset(gauge_offset(potential, grid), gauge_sd)
+
+
+def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -> torch.Tensor:
+    """Total prior / regulariser penalty ``= -log prior`` (up to a constant).
+
+    This is the SINGLE place the prior enters the objective; ``neg_log_posterior``
+    is just ``-loglik + prior_penalty(...)``.  ``prior=None`` means a **pure MLE**
+    fit -- no regularisation at all -- and returns exactly ``0``.
+
+    A ``None`` prior is numerically identical to a ``PriorConfig`` with every term
+    off (``curvature_weight=0``, ``logD_mean=None``, ``gp_sigma=None``,
+    ``l2_weight=0``), but skips the (zero-weighted) curvature evaluation, so it is
+    both cleaner and slightly cheaper.
+    """
+    if prior is None:
+        return torch.zeros((), dtype=grid.dtype, device=grid.device)
+    
+    if prior.curvature_weight:
+        if isinstance(potential, dfl_potential.SplinePotential):
+            reg = prior.curvature_weight * curvature_penalty_spline(
+                potential.theta, potential.knots_x
+            )
+        else:
+            u_grid = _BasePotential_on_grid(potential, grid)
+            dx = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
+            reg = prior.curvature_weight * curvature_penalty(u_grid, dx)
+    else:
+        reg = torch.zeros((), dtype=grid.dtype, device=grid.device)
+        
     if prior.gp_sigma is not None:
         reg = reg + gp_penalty(potential, grid, prior)
     if prior.l2_weight:
         pnorm = sum((p ** 2).sum() for p in potential.parameters())
         reg = reg + prior.l2_weight * pnorm
-    return -ll + reg
+    if prior.max_entropy_weight:
+        reg = reg + max_entropy_penalty(potential, D, grid, prior)
+    return reg
 
 
-# ---------------------------------------------------------------------------
-# Secondary complete-data (joint) objective
-# ---------------------------------------------------------------------------
-def complete_data_loglik(
-    x_path: torch.Tensor,
-    times: torch.Tensor,
-    colors: torch.Tensor,
-    T: float,
-    time_grid: torch.Tensor,
-    potential,
-    D: torch.Tensor,
-    rates: EffectiveRates,
-    C: torch.Tensor,
-    R0: float,
-    log_p0=None,
+def neg_log_posterior(
+    ipt, colors, mask, potential, D, rates, grid, C, R0, prior: PriorConfig | None,
+    p0=None, compile_mode=None, propagate_dtype=None,
 ) -> torch.Tensor:
-    """Joint log-lik of a path + photons (SPEC 4.5).
+    """``-loglik + prior_penalty`` (marginal-based).  Scalar tensor.
 
-    ``x_path``   : [M+1] latent positions on ``time_grid`` (step h uniform).
-    ``time_grid``: [M+1] times (ms) of the path samples, ``time_grid[0]=0``.
-    ``times``/``colors`` : photon arrival times (ms) / colours.
-    Photon emission terms evaluate ``mu_c`` at the path point nearest ``t_k``.
+    With ``prior=None`` this is the pure negative log-likelihood, i.e. a true MLE
+    objective (see ``prior_penalty``).  Otherwise the curvature and ``logD`` priors
+    act on ``u_grid``/``D`` only.  ``compile_mode`` / ``propagate_dtype`` are
+    forwarded to ``marginal_loglik_batch`` (defaults -> eager float64).
     """
-    h = float(time_grid[1] - time_grid[0])
-
-    # --- dynamics term: sum_m log N(x_{m+1}; x_m - D u' h, 2 D h) ---
-    trans = em_transition_logp(x_path, D, potential, h).sum()
-
-    # --- emission at photons: sum_k log mu_{c_k}(x(t_k)) ---
-    idx = torch.clamp(torch.round(times / h).long(), 0, x_path.shape[0] - 1)
-    x_at_photon = x_path[idx]
-    mu_G, mu_R = emission_rates(x_at_photon, rates, C, R0)
-    mu_c = torch.where(colors == 0, mu_G, mu_R)
-    emit = torch.log(mu_c).sum()
-
-    # --- depletion: - integral_0^T mu(x(t)) dt  ~  - h sum_m mu(x_m) ---
-    mu_G_path, mu_R_path = emission_rates(x_path, rates, C, R0)
-    mu_path = mu_G_path + mu_R_path
-    depl = -h * mu_path.sum()
-
-    ll = trans + emit + depl
-    if log_p0 is not None:
-        ll = ll + log_p0(x_path[0])
-    return ll
+    ll = marginal_loglik_batch(
+        ipt, colors, mask, potential, D, rates, grid, C, R0, p0=p0,
+        compile_mode=compile_mode, propagate_dtype=propagate_dtype,
+    )
+    return -ll + prior_penalty(potential, D, grid, prior)

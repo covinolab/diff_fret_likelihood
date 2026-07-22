@@ -142,8 +142,8 @@ def test_short_chain_smoke():
     assert ps.rates.shape == (Sn, S.N_RATES)
     assert torch.isfinite(ps.U).all() and torch.isfinite(ps.D).all()
     assert (ps.D > 0).all() and (ps.rates > 0).all()
-    # gauge-fixed landscapes have min 0
-    assert torch.allclose(ps.U.min(dim=1).values, torch.zeros(Sn, dtype=torch.float64),
+    # gauge-fixed landscapes have grid-mean 0
+    assert torch.allclose(ps.U.mean(dim=1), torch.zeros(Sn, dtype=torch.float64),
                           atol=1e-9)
     # band helpers
     band = ps.U_band((0.1, 0.9))

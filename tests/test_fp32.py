@@ -137,7 +137,7 @@ def _fit_D(propagate_dtype):
     res = dfl.fit(_Batch(ipt, colors, mask), grid, pot, C, consts.R0,
                   D_init=5.0, rates_init=rates, prior=dfl.PriorConfig(curvature_weight=0.05),
                   optim=optim, fit_D=True, fit_rates=False, verbose=False)
-    return res.D, res.final_loss
+    return res.D, res.best_loss
 
 
 def test_fp32_fit_recovers_same_as_fp64():

@@ -12,10 +12,10 @@ See ``SPEC`` (module docstrings carry the section references) and the notebook
 
 from __future__ import annotations
 
-import torch
-
+from ._version import __version__
 from .config import (
     DTYPE, GridConfig, PotentialConfig, PhysicsConstants, PriorConfig, OptimConfig,
+    use_float64,
 )
 from .potential import build_potential, MLPPotential, SplinePotential
 from .photophysics import EffectiveRates, fret_efficiency, emission_rates
@@ -26,23 +26,27 @@ from .forward import (
     marginal_loglik, marginal_loglik_batch, reference_loglik,
     build_propagator_from_u,
 )
-from .objective import curvature_penalty, neg_log_posterior, complete_data_loglik
+from .objective import curvature_penalty, prior_penalty, neg_log_posterior
 from .dynamics import em_transition_logp
-from .infer import fit, FitResult, FreeRates, recovered_potential, posterior_occupancy
+from .infer import fit, FitResult, FreeRates, recovered_potential
+from .fisher import cramer_rao_bound, CRBResult
 from . import simulate
 from . import init
 from . import sample
 
-# float64 in the likelihood path is non-negotiable (SPEC section 8).
-torch.set_default_dtype(DTYPE)
+# NOTE: importing this package no longer mutates global torch state. The
+# likelihood is designed for float64 (SPEC section 8); call ``use_float64()`` to
+# make it the global default, or pass ``dtype=DTYPE`` explicitly.
 
 __all__ = [
+    "__version__", "use_float64",
     "DTYPE", "GridConfig", "PotentialConfig", "PhysicsConstants", "PriorConfig",
     "OptimConfig", "build_potential", "MLPPotential", "SplinePotential",
     "EffectiveRates", "fret_efficiency", "emission_rates", "smoluchowski",
     "symmetrize", "stationary", "assert_generator_valid", "marginal_loglik",
     "marginal_loglik_batch", "reference_loglik", "build_propagator_from_u",
-    "curvature_penalty", "neg_log_posterior", "complete_data_loglik",
+    "curvature_penalty", "prior_penalty", "neg_log_posterior",
     "em_transition_logp", "fit", "FitResult", "FreeRates",
-    "recovered_potential", "posterior_occupancy", "simulate", "init", "sample",
+    "recovered_potential", "cramer_rao_bound", "CRBResult",
+    "simulate", "init", "sample",
 ]

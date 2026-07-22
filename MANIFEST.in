@@ -1,0 +1,6 @@
+include *.pyx *.pxd
+include LICENSE README.md
+recursive-include tests *.py
+prune build
+prune tests/_cache
+global-exclude *.so *.o *.c

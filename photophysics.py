@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .config import DTYPE, PhysicsConstants
+from .config import DTYPE
 
 
 @dataclass

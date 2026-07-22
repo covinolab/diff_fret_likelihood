@@ -79,11 +79,7 @@ class MLPPotential(_BasePotential):
             if i < len(dims) - 2:
                 layers.append(act())
         self.net = nn.Sequential(*layers).to(DTYPE)
-        # Initialise near-flat so the fit starts from a featureless landscape.
-        with torch.no_grad():
-            last = self.net[-1]
-            last.weight.mul_(0.01)
-            last.bias.zero_()
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xn = (x - self.x_center) / self.x_scale

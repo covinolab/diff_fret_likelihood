@@ -44,7 +44,7 @@ import torch
 from torch.func import functional_call
 
 from .config import DTYPE, PriorConfig
-from .objective import neg_log_posterior
+from .objective import neg_log_posterior, gauge_penalty_from_offset
 from .photophysics import EffectiveRates
 
 N_RATES = 4  # a_g, a_r, bg_g, bg_r
@@ -116,6 +116,12 @@ def build_log_prob(
     and is differentiable w.r.t. the flat vector ``z``.  ``sample_posterior`` wraps it
     into a pyro ``potential_fn`` (energy ``= -log_prob_func(z)``); pyro takes the grad.
     """
+    if prior is None:
+        raise ValueError(
+            "Posterior sampling requires a proper prior; prior=None (pure MLE) is "
+            "only valid for point estimation via infer.fit. Pass a PriorConfig with "
+            "gp_sigma set."
+        )
     if prior.gp_sigma is None:
         raise ValueError(
             "Posterior sampling needs a PROPER landscape prior: set prior.gp_sigma "
@@ -154,7 +160,10 @@ def build_log_prob(
                   compile_mode, propagate_dtype),
         )
         rate_prior = 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()
-        gauge = (0.5 * (flat_pot.mean() / gauge_sd) ** 2) if is_spline \
+        # Same pure-gauge anchor infer.fit uses (objective.gauge_penalty). Must read
+        # flat_pot.mean() from the swapped z-slice here, not potential.theta (the
+        # module's params are only substituted inside functional_call above).
+        gauge = gauge_penalty_from_offset(flat_pot.mean(), gauge_sd) if is_spline \
             else torch.zeros((), dtype=z.dtype, device=z.device)
         return -(nlp + rate_prior + gauge)
 
@@ -169,7 +178,7 @@ def build_log_prob(
 # --------------------------------------------------------------------------- #
 @dataclass
 class PosteriorSamples:
-    U: torch.Tensor       # [S, G] gauge-fixed landscapes (min = 0)
+    U: torch.Tensor       # [S, G] gauge-fixed landscapes (grid-mean = 0)
     D: torch.Tensor       # [S]
     rates: torch.Tensor   # [S, 4]  (a_g, a_r, bg_g, bg_r)
     theta: torch.Tensor   # [S, npot] raw potential params
@@ -242,6 +251,12 @@ def sample_posterior(
 
     Returns ``PosteriorSamples`` (S = number of post-warmup draws).
     """
+    if prior is None:
+        raise ValueError(
+            "sample_posterior requires a proper prior; prior=None (pure MLE) is only "
+            "valid for point estimation via infer.fit. Pass a PriorConfig with gp_sigma."
+        )
+
     import pyro
     from pyro.infer import HMC, MCMC, NUTS
 
@@ -311,7 +326,7 @@ def sample_posterior(
         pdict = _unflatten(flat_pot, specs)  # bare potential keys
         with torch.no_grad():
             u = functional_call(potential, pdict, args=(grid,))
-            u = u - u.min()
+            u = u - u.mean()   # grid-mean-zero reporting gauge (matches recovered_potential)
         U_list.append(u)
         theta_list.append(flat_pot.clone())
         D_list.append(z[npot].exp())

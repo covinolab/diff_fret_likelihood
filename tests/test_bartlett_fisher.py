@@ -1,9 +1,10 @@
 """Bartlett + Fisher score-at-truth test for the equilibrium likelihood.
 
 A powered-null correctness test: simulate long *equilibrium* photon traces at a
-known truth (double well, bound 4 nm / unbound 9 nm, 4 k_BT barrier, D=20) and
-verify the marginal likelihood is the correct normalized density for that
-data-generating process, on the parameterisation inference uses.
+known truth (symmetric quartic double well, 4 k_BT barrier, D=10) with the
+in-project Cython simulator, and verify the marginal likelihood is the correct
+normalized density for that data-generating process, on the parameterisation
+inference uses.
 
 Two identities are checked at the true parameter ``phi*``:
 
@@ -15,35 +16,23 @@ Two identities are checked at the true parameter ``phi*``:
     Reported as the full-matrix relative Frobenius distance and per-parameter
     diagonal ratios (~1).  This is the part that detects misspecification.
 
-Parameterisation ``phi = [g_0..g_10 (force-spline knots), lnD, log a_g, log a_r,
-log bg_g, log bg_r]`` (P=16): the landscape, the diffusion coefficient, and the
+Parameterisation ``phi = [y_0..y_{K-1} (potential value knots), lnD, log a_g,
+log a_r, log bg_g, log bg_r]``: the landscape, the diffusion coefficient, and the
 four photophysics rates are all scored together.
 
-Because the simulator integrates a *cubic* spline through the force knots, the
-map g -> U(x) is exactly affine (``U = B @ g + b0``); we reconstruct that basis
-from the simulator's own FE integrator, so the likelihood landscape equals the
-data-generating landscape to machine precision (zero representation error) and
-Bartlett-1 is evaluated at the genuine truth, not a fitted point.
+The in-project simulator (``simulator.pyx``) integrates a cubic spline whose
+*value* knots ARE the potential ``U(x_knots)`` (Boltzmann start drawn internally,
+no ``x0``).  The likelihood's ``SplinePotential`` uses the SAME natural-cubic
+value-knot parameterisation, so the exact affine map ``U(grid) = B @ y`` is just
+that spline basis: representation error is zero by construction (verified against
+the simulator's own GSL spline in ``selfcheck_linearity``), and Bartlett-1 is
+evaluated at the genuine truth.  The potential knots span a WIDE domain [2,10]
+with steep walls so traces stay inside the (no-reflecting-boundary) simulator
+domain; the likelihood grid is the narrower FRET-identifiable band, on which the
+same knots reproduce U exactly.
 
-The (slow) simulation is cached to disk keyed on the truth config, so editing
-the likelihood re-runs only the fast scoring/Fisher path -- this file is a
-regression guard on the equilibrium likelihood.
-
-Findings (validated up to ~5e6 photons):
-  * Landscape and diffusion are UNBIASED: grid-free score_U(x) max|z| ~ 1-2 over
-    the full grid, z(lnD) ~ 0, at all sizes.
-  * The Fisher information-matrix equality HOLDS to a few percent (diagonal
-    ratios ~1.0), photophysics included -- the likelihood is correctly specified.
-  * The FOUR absolute photon-rate scores carry a small O(N_traces / sqrt(M))
-    boundary term (M = total photons) from the photon-stream *windowing
-    convention*: the batch path conditions on the first photon and drops the
-    leading [0, t_1] and trailing [t_K, T] survival intervals (~1 unmodeled
-    photon/trace).  It is grid-independent and p0-independent, and it is
-    suppressed by LONGER traces (confirmed: at 4.8e6 photons the rate Hotelling
-    p is 0.005 with 5000x150ms traces vs 0.16 with 1250x600ms traces).  It is a
-    convention property, not a bulk defect; use longer traces for high-photon
-    validation, or model the full window (survival gaps) if the absolute rate
-    normalisation must be unbiased at any trace length.
+The (slow) simulation is cached to disk keyed on the truth config, so editing the
+likelihood re-runs only the fast scoring/Fisher path.
 
 Run modes:
     python -m diff_fret_likelihood.tests.test_bartlett_fisher --pilot   # calibration only
@@ -60,11 +49,17 @@ import time
 
 import numpy as np
 import torch
+from scipy.interpolate import CubicSpline
 
-# Make the package + benchmark harness importable regardless of cwd.
-_LA = "/home/dingeldein/Desktop/fret_sbi/likelihood_analysis"
-if _LA not in sys.path:
-    sys.path.insert(0, _LA)
+# Make the package (`import diff_fret_likelihood`, incl. the compiled
+# `diff_fret_likelihood.simulator`) importable when running from a source tree,
+# regardless of cwd -- and inherited by the fork-pool workers. Harmless once the
+# package is pip-installed.
+_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../diff_fret_likelihood
+_ROOT = os.path.dirname(_PKG)                                        # project root
+for _p in (_ROOT,):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import diff_fret_likelihood as dfl  # noqa: E402
 from diff_fret_likelihood.config import DTYPE, GridConfig  # noqa: E402
@@ -73,12 +68,6 @@ from diff_fret_likelihood.forward import (  # noqa: E402
 )
 from diff_fret_likelihood.generator import stationary  # noqa: E402
 from diff_fret_likelihood.photophysics import EffectiveRates  # noqa: E402
-from diff_fret_likelihood.simulate import (  # noqa: E402
-    assemble_theta, ground_truth_landscape, simulate_traces, _ensure_path,
-)
-from benchmark.configs import (  # noqa: E402
-    KNOT_X, K, X_MIN, X_MAX, PHOTOPHYSICS, consts_and_rates, make_cfg,
-)
 
 torch.set_default_dtype(DTYPE)
 
@@ -88,17 +77,29 @@ torch.set_default_dtype(DTYPE)
 _BF_PDT = torch.float32 if os.environ.get("BARTLETT_FP32") == "1" else None
 
 # --------------------------------------------------------------------------- #
-# Truth configuration (validated in calibration)
+# Truth configuration (value-knot double well; self-confining domain)
 # --------------------------------------------------------------------------- #
-X_B, W = 6.5, 2.5                       # symmetric quartic: minima at 4 & 9 nm
-A_QUARTIC = 4.0 / W ** 4                 # barrier = 4 kT above both wells
-LOG10_D = float(np.log10(20.0))          # D = 20 nm^2/ms
-TOTAL_TIME = float(os.environ.get("BARTLETT_TT", "150.0"))  # ms (~16 crossings)
-N_MAX_PHOTONS = 30000                    # never truncate a 150 ms trace
-X_INIT = [3.7, 9.3]
-SPLINE_TYPE = "cubic"                    # -> g->U affine (exact basis)
-PHOTOPHYSICS_NAME = "realistic"          # kD=6, eta=.85, backgrounds, crosstalk
+# Potential value knots span a WIDE domain with steep walls (no reflecting
+# boundary in the simulator -> confinement must come from the potential).
+XK_MIN, XK_MAX, K = 2.0, 10.0, 15
+x_knots = np.linspace(XK_MIN, XK_MAX, K)
+U_true_fn = lambda x: 4.0 * (((x - 6.0) / 1.2) ** 2 - 1.0) ** 2   # wells 4.8/7.2, 4 kT barrier
+
+# Likelihood grid = FRET-identifiable band (the same knots reproduce U here
+# exactly; occupancy outside is ~exp(-40) so nothing is lost).
+X_MIN, X_MAX = 3.5, 8.5
 N_GRID = 160
+
+LOG10_D = float(np.log10(10.0))                          # D = 10 nm^2/ms
+TOTAL_TIME = float(os.environ.get("BARTLETT_TT", "150.0"))  # ms (many crossings)
+N_MAX_PHOTONS = 30000                                    # per-channel budget (never truncates)
+DT_SIM = 5.0e-6                                          # Langevin integration step (ms)
+
+# photophysics (realistic rung): kD=6, eta=.85, backgrounds, crosstalk
+R0 = 6.0
+KD, ETA_G, ETA_R = 6.0, 0.85, 0.85
+K_GB, K_RB = 0.5, 1.0
+C_GR, C_RG = 0.10, 0.05
 
 # scoring / sizes
 N_TEST = int(os.environ.get("BARTLETT_N", "300"))
@@ -106,8 +107,10 @@ N_FULL = 1200
 SEED_OFFSET = int(os.environ.get("BARTLETT_SEED", "0"))   # independent replicas
 FISHER_SUBSET = 160                      # traces used for the E[-H] Hessian
 SCORE_CHUNK = int(os.environ.get("BARTLETT_CHUNK", "32"))  # vmap chunk for scores
-CACHE_DIR = os.path.join(_LA, "benchmark", "_bartlett")
-FIG_DIR = os.path.join(_LA, "benchmark", "figures")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(_HERE, "_cache")
+FIG_DIR = os.path.join(_HERE, "figures")
 
 # parameter layout
 IDX_LND = K
@@ -121,72 +124,57 @@ THRESH = dict(maxz_gridfree=5.0, z_knot=4.5, z_lnD=4.0, z_rate=4.0,
 
 
 # --------------------------------------------------------------------------- #
-# Truth landscape (analytic quartic -> simulator force knots)
+# Truth landscape (value knots) + exact affine basis U(x) = B @ y
 # --------------------------------------------------------------------------- #
-def g_true_knots() -> np.ndarray:
-    """Analytic force knots g_i = -U'(x_i) of the quartic double well."""
-    x = KNOT_X
-    return -4.0 * A_QUARTIC * (x - X_B) * ((x - X_B) ** 2 - W ** 2)
+def y_true_knots() -> np.ndarray:
+    """Potential value knots y_i = U(x_i) of the quartic double well."""
+    return np.asarray(U_true_fn(x_knots), dtype=np.float64)
 
 
-def build_cfg(total_time=TOTAL_TIME):
-    return make_cfg("equilibrium", spline_type=SPLINE_TYPE, x_init=list(X_INIT),
-                    total_time=total_time, N_max_photons=N_MAX_PHOTONS)
+def value_knot_basis(grid_np) -> np.ndarray:
+    """(G, K) natural-cubic VALUE basis so U(grid) = B @ y (b0 = 0).
 
-
-def build_theta(g_knots, log10_D=LOG10_D):
-    pp = PHOTOPHYSICS[PHOTOPHYSICS_NAME]
-    return assemble_theta(g_knots, log10_D, pp.R0, pp.kD, pp.k_gb, pp.k_rb,
-                          pp.eta_g, pp.eta_r, pp.C_gr, pp.C_rg)
-
-
-# --------------------------------------------------------------------------- #
-# Exact affine force-knot basis:  U(x) = B @ g + b0
-# --------------------------------------------------------------------------- #
-def build_force_basis(cfg, theta, grid_np):
-    """Return (B [G,K], b0 [G]) so that U(g) = B @ g + b0 reproduces the
-    simulator's realised free energy exactly (cubic spline => affine in g)."""
-    _ensure_path()
-    from utils import eval_free_energy_from_config
-    fe = eval_free_energy_from_config(cfg)
-
-    def raw_U(g):
-        th = np.asarray(theta, np.float64).copy()
-        th[1:K + 1] = g
-        _, U = fe(th, np.asarray(grid_np, np.float64))
-        return U
-
-    b0 = raw_U(np.zeros(K))
+    Identical construction to the likelihood's ``SplinePotential._basis`` and to
+    the simulator's GSL cubic spline through the same knots -> zero
+    representation error (checked in ``selfcheck_linearity``)."""
     B = np.empty((grid_np.size, K), dtype=np.float64)
     for k in range(K):
         e = np.zeros(K); e[k] = 1.0
-        B[:, k] = raw_U(e) - b0
-    return B, b0
+        B[:, k] = CubicSpline(x_knots, e, bc_type="natural")(grid_np)
+    return B
 
 
-class ForceKnotPotential:
-    """Potential parameterised by force-spline knots: on_grid = B @ g + b0.
+class LinearKnotPotential:
+    """Potential linear in the knot heights: on_grid = B @ y + b0.
 
-    ``g`` is a view into the leaf ``phi`` so autograd delivers d logL / d g.
+    ``y`` is a view into the leaf ``phi`` so autograd delivers d logL / d y.
     """
 
-    def __init__(self, g, B, b0):
-        self.g, self.B, self.b0 = g, B, b0
+    def __init__(self, y, B, b0):
+        self.y, self.B, self.b0 = y, B, b0
 
     def on_grid(self, grid):
-        return self.B @ self.g + self.b0
+        return self.B @ self.y + self.b0
 
 
 # --------------------------------------------------------------------------- #
 # Truth parameter vector phi*  and fixed calibration (C, R0, dx)
 # --------------------------------------------------------------------------- #
+def consts_and_rates(device="cpu"):
+    """(PhysicsConstants, crosstalk tensor C, EffectiveRates) for the truth."""
+    consts = dfl.PhysicsConstants(
+        R0=R0, C_gg=1.0 - C_GR, C_gr=C_GR, C_rg=C_RG, C_rr=1.0 - C_RG
+    )
+    C = consts.crosstalk_tensor(device)
+    rates = EffectiveRates.from_physics(KD, ETA_G, ETA_R, K_GB, K_RB, device=device)
+    return consts, C, rates
+
+
 def truth_phi(device):
-    pp = PHOTOPHYSICS[PHOTOPHYSICS_NAME]
-    rates = EffectiveRates.from_physics(pp.kD, pp.eta_g, pp.eta_r, pp.k_gb,
-                                        pp.k_rb, device=device)
-    g = torch.as_tensor(g_true_knots(), dtype=DTYPE, device=device)
+    _, _, rates = consts_and_rates(device)
+    y = torch.as_tensor(y_true_knots(), dtype=DTYPE, device=device)
     phi = torch.empty(P_DIM, dtype=DTYPE, device=device)
-    phi[:K] = g
+    phi[:K] = y
     phi[IDX_LND] = float(np.log(10.0 ** LOG10_D))
     phi[K + 1] = torch.log(rates.a_g)
     phi[K + 2] = torch.log(rates.a_r)
@@ -237,8 +225,8 @@ def _mp_recursion(prop, ipt, colors, mask, p0v, pdt):
 def single_logL(phi, ipt, colors, mask, grid, C, R0, B, b0, dx, jitter=1e-12,
                 p0=None):
     """Marginal log-lik of ONE (padded) trace -- vmap/jacrev friendly."""
-    g, D, rates = unpack_phi(phi)
-    u = B @ g + b0
+    yk, D, rates = unpack_phi(phi)
+    u = B @ yk + b0
     u = u - u.min()
     prop = build_propagator_from_u(u, D, rates, grid, C, R0, dx, jitter)
     p0v = stationary(u) if p0 is None else p0
@@ -248,8 +236,8 @@ def single_logL(phi, ipt, colors, mask, grid, C, R0, B, b0, dx, jitter=1e-12,
 def batch_loglik_from_phi(phi, ipt, colors, mask, grid, C, R0, B, b0,
                           reduce="sum", p0=None):
     """Batched marginal log-lik through the tested package path."""
-    g, D, rates = unpack_phi(phi)
-    pot = ForceKnotPotential(g, B, b0)
+    yk, D, rates = unpack_phi(phi)
+    pot = LinearKnotPotential(yk, B, b0)
     return marginal_loglik_batch(ipt, colors, mask, pot, D, rates, grid, C, R0,
                                  p0=p0, reduce=reduce, propagate_dtype=_BF_PDT)
 
@@ -267,33 +255,20 @@ def single_logL_u(u, ipt, colors, mask, D, rates, grid, C, R0, dx, jitter=1e-12,
 # --------------------------------------------------------------------------- #
 # Cached parallel simulation (CPU, fork pool -- MUST run before any CUDA work)
 # --------------------------------------------------------------------------- #
-def _cache_key(g_knots, log10_D, n_traces):
+def _cache_key(y_knots, log10_D, n_traces):
     h = hashlib.sha1()
-    for a in (np.round(g_knots, 8), np.array([log10_D, TOTAL_TIME, N_MAX_PHOTONS,
-              N_GRID]), np.array(X_INIT)):
+    for a in (np.round(y_knots, 8), np.round(x_knots, 8),
+              np.array([log10_D, TOTAL_TIME, N_MAX_PHOTONS, DT_SIM, N_GRID,
+                        R0, KD, ETA_G, ETA_R, K_GB, K_RB, C_GR, C_RG])):
         h.update(np.ascontiguousarray(a, np.float64).tobytes())
-    h.update(f"{SPLINE_TYPE}|{PHOTOPHYSICS_NAME}|{n_traces}|s{SEED_OFFSET}".encode())
+    h.update(f"{n_traces}|s{SEED_OFFSET}".encode())
     return h.hexdigest()[:16]
-
-
-def _sim_worker(args):
-    cfg, theta, n_sub, seed = args
-    np.random.seed(seed)
-    batch, _ = simulate_traces(cfg, theta, "equilibrium", n_traces=n_sub,
-                               min_photons=50, max_photons=None, device="cpu",
-                               verbose=False)
-    out = []
-    for i in range(batch.n_traces):
-        n = int(batch.lengths[i])
-        out.append((batch.ipt[i, :n].numpy().astype(np.float64),
-                    batch.colors[i, :n].numpy().astype(np.int64)))
-    return out
 
 
 def simulate_cached(n_traces, n_workers=24, verbose=True):
     """Return (ipt, colors, mask, lengths) CPU tensors; simulate once + cache."""
-    g_knots = g_true_knots()
-    key = _cache_key(g_knots, LOG10_D, n_traces)
+    y_knots = y_true_knots()
+    key = _cache_key(y_knots, LOG10_D, n_traces)
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"eq_{key}.pt")
     if os.path.exists(path):
@@ -305,35 +280,13 @@ def simulate_cached(n_traces, n_workers=24, verbose=True):
     if verbose:
         print(f"[cache] miss -> simulating {n_traces} equilibrium traces "
               f"(this is the slow, one-time step)...")
-    import multiprocessing as mp
-    cfg = build_cfg()
-    theta = build_theta(g_knots)
-    n_workers = max(1, min(n_workers, mp.cpu_count()))
-    per = int(np.ceil(n_traces / n_workers))
-    jobs = [(cfg, theta, per, 1234 + 7919 * w + 100003 * SEED_OFFSET)
-            for w in range(n_workers)]
-    t0 = time.perf_counter()
-    ctx = mp.get_context("fork")
-    with ctx.Pool(n_workers) as pool:
-        chunks = pool.map(_sim_worker, jobs)
-    raw = [t for ch in chunks for t in ch][:n_traces]
-    dt = time.perf_counter() - t0
-    if verbose:
-        print(f"[cache] simulated {len(raw)} traces in {dt:.1f}s "
-              f"on {n_workers} workers")
-
-    Kmax = max(len(i) for i, _ in raw)
-    B = len(raw)
-    ipt = torch.zeros(B, Kmax, dtype=DTYPE)
-    colors = torch.zeros(B, Kmax, dtype=torch.int64)
-    mask = torch.zeros(B, Kmax, dtype=torch.bool)
-    lengths = torch.zeros(B, dtype=torch.int64)
-    for b, (i, c) in enumerate(raw):
-        n = len(i)
-        ipt[b, :n] = torch.as_tensor(i, dtype=DTYPE)
-        colors[b, :n] = torch.as_tensor(c)
-        mask[b, :n] = True
-        lengths[b] = n
+    batch = dfl.simulate.simulate_equilibrium(
+        x_knots, y_knots, D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB, k_rb=K_RB,
+        eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
+        T=TOTAL_TIME, dt=DT_SIM, N_max=N_MAX_PHOTONS,
+        n_traces=n_traces, min_photons=50, n_workers=n_workers, seed=SEED_OFFSET,
+        device="cpu", verbose=verbose)
+    ipt, colors, mask, lengths = batch.ipt, batch.colors, batch.mask, batch.lengths
     torch.save({"ipt": ipt, "colors": colors, "mask": mask, "lengths": lengths},
                path + ".tmp")
     os.replace(path + ".tmp", path)
@@ -432,12 +385,14 @@ def fisher_stats(scores, EH):
 # --------------------------------------------------------------------------- #
 # Grid-free functional score (diagnostic; representation-error-free arbiter)
 # --------------------------------------------------------------------------- #
-def gridfree_score(theta, cfg, ipt, colors, mask, grid, C, R0, rates, D,
-                   dx, chunk=SCORE_CHUNK, p0=None):
+def gridfree_score(ipt, colors, mask, grid, C, R0, rates, D, dx,
+                   chunk=SCORE_CHUNK, p0=None):
     """max|z| of per-trace d logL / d U(x) over the full grid at the exact true
     U(x) -- representation-free arbiter of likelihood correctness."""
+    from diff_fret_likelihood.simulator import eval_spline
+
     gnp = grid.detach().cpu().numpy()
-    U_np = ground_truth_landscape(cfg, theta, gnp)
+    U_np = np.asarray(eval_spline(x_knots, y_true_knots(), gnp), dtype=np.float64)
     U_true = torch.as_tensor(U_np - U_np.min(), dtype=DTYPE, device=grid.device)
     N = ipt.shape[0]
 
@@ -478,13 +433,13 @@ def gridfree_score(theta, cfg, ipt, colors, mask, grid, C, R0, rates, D,
 # --------------------------------------------------------------------------- #
 # Self-checks (gate everything)
 # --------------------------------------------------------------------------- #
-def selfcheck_linearity(cfg, theta, grid_np, B, b0):
-    _ensure_path()
-    from utils import eval_free_energy_from_config
-    fe = eval_free_energy_from_config(cfg)
-    _, U_direct = fe(theta, grid_np)
-    U_affine = B @ g_true_knots() + b0
-    return float(np.abs(U_affine - U_direct).max())
+def selfcheck_linearity(B, b0, grid_np):
+    """The likelihood's scipy natural-cubic value basis must equal the
+    simulator's own GSL cubic spline through the same knots (both natural)."""
+    from diff_fret_likelihood.simulator import eval_spline
+    U_gsl = np.asarray(eval_spline(x_knots, y_true_knots(), grid_np), dtype=np.float64)
+    U_affine = B @ y_true_knots() + b0
+    return float(np.abs(U_affine - U_gsl).max())
 
 
 def selfcheck_fd_score(phi, ipt, colors, mask, grid, C, R0, B, b0, dx,
@@ -539,18 +494,15 @@ def run(n_traces=N_TEST, device=None, make_fig=False, verbose=True, n_grid=N_GRI
     n_photons = int(lengths.sum())
     ipt = ipt.to(device); colors = colors.to(device); mask = mask.to(device)
 
-    # 2. truth + exact basis + fixed calibration
-    cfg = build_cfg()
-    theta = build_theta(g_true_knots())
+    # 2. truth + exact value-knot basis + fixed calibration
     grid = GridConfig(X_MIN, X_MAX, n_grid).build(device)
     dx = float(grid[1] - grid[0])
     gnp = grid.detach().cpu().numpy()
-    B_np, b0_np = build_force_basis(cfg, theta, gnp)
+    B_np = value_knot_basis(gnp)
+    b0_np = np.zeros(gnp.size, dtype=np.float64)
     Bt = torch.as_tensor(B_np, dtype=DTYPE, device=device)
     b0t = torch.as_tensor(b0_np, dtype=DTYPE, device=device)
-    pp = PHOTOPHYSICS[PHOTOPHYSICS_NAME]
-    _, C, rates_true = consts_and_rates(pp, device=device)
-    R0 = pp.R0
+    _, C, rates_true = consts_and_rates(device=device)
     phi = truth_phi(device)
     _, D_true, _ = unpack_phi(phi)
 
@@ -561,13 +513,13 @@ def run(n_traces=N_TEST, device=None, make_fig=False, verbose=True, n_grid=N_GRI
               f"({n_photons/n_traces:.0f}/trace)  P={P_DIM}  n_grid={n_grid}")
 
     # 3. self-checks (gate)
-    lin = selfcheck_linearity(cfg, theta, gnp, B_np, b0_np)
+    lin = selfcheck_linearity(B_np, b0_np, gnp)
     probes = [K // 2, IDX_LND, K + 1, K + 3]           # a knot, lnD, a_g, bg_g
     fd = selfcheck_fd_score(phi, ipt, colors, mask, grid, C, R0, Bt, b0t, dx,
                             probes)
     equiv = selfcheck_equivalence(phi, ipt, colors, mask, grid, C, R0, Bt, b0t, dx)
     if verbose:
-        print(f"\n  [self-check] basis linearity  max|B g + b0 - fe(g)| = {lin:.2e}")
+        print(f"\n  [self-check] basis vs GSL spline  max|B y - eval_spline| = {lin:.2e}")
         for j, an, fdv, re in fd:
             print(f"  [self-check] FD score phi[{j:2d}]  an={an:+.4e} "
                   f"fd={fdv:+.4e}  rel={re:.2e}")
@@ -578,8 +530,7 @@ def run(n_traces=N_TEST, device=None, make_fig=False, verbose=True, n_grid=N_GRI
     b1 = bartlett1_stats(scores)
 
     # 5. grid-free diagnostic (representation-free)
-    gf = gridfree_score(theta, cfg, ipt, colors, mask, grid, C, R0, rates_true,
-                        D_true, dx)
+    gf = gridfree_score(ipt, colors, mask, grid, C, R0, rates_true, D_true, dx)
 
     res = dict(n_traces=n_traces, n_photons=n_photons, lin=lin, fd=fd,
                equiv=equiv, b1=b1, gf=gf, grid=gnp, n_grid=n_grid,
@@ -618,7 +569,7 @@ def report(res):
     print(f"  grid-free  max|z|(full grid) = {gf['maxz']:.2f} at x={gf['x_maxz']:.2f} nm"
           f"   [gauge Sum_x score={gf['gauge']:.1e}]")
     jz = int(np.argmax(np.abs(z[:K])))
-    print(f"  force-knots max|z| = {np.abs(z[:K]).max():.2f} (knot {jz}, x={KNOT_X[jz]:.2f})")
+    print(f"  potential-knots max|z| = {np.abs(z[:K]).max():.2f} (knot {jz}, x={x_knots[jz]:.2f})")
     print(f"  z(lnD) = {z[IDX_LND]:+.2f}")
     for i, nm in enumerate(RATE_NAMES):
         print(f"  z({nm:8s}) = {z[K+1+i]:+.2f}")
@@ -632,7 +583,7 @@ def report(res):
               "  ".join(f"{nm.split('_',1)[1]}={dr[K+1+i]:.2f}"
                         for i, nm in enumerate(RATE_NAMES)))
         kd = dr[:K]
-        print(f"  diag ratio  force-knots: min={kd.min():.2f} max={kd.max():.2f} "
+        print(f"  diag ratio  potential-knots: min={kd.min():.2f} max={kd.max():.2f} "
               f"median={np.median(kd):.2f}")
     if "p0diag" in res:
         pd = res["p0diag"]
@@ -649,7 +600,7 @@ def verdict(res):
     z = b1["z"]
     f = []
     if res["lin"] > 1e-8:
-        f.append(f"basis linearity {res['lin']:.1e} > 1e-8")
+        f.append(f"basis vs GSL spline {res['lin']:.1e} > 1e-8")
     if max(re for *_, re in res["fd"]) > 1e-3:
         f.append("FD score check > 1e-3")
     if res["equiv"] > 1e-6:
@@ -659,7 +610,7 @@ def verdict(res):
     if gf["maxz"] > THRESH["maxz_gridfree"]:
         f.append(f"grid-free max|z| {gf['maxz']:.1f} > {THRESH['maxz_gridfree']}")
     if np.abs(z[:K]).max() > THRESH["z_knot"]:
-        f.append(f"force-knot max|z| {np.abs(z[:K]).max():.1f} > {THRESH['z_knot']}")
+        f.append(f"potential-knot max|z| {np.abs(z[:K]).max():.1f} > {THRESH['z_knot']}")
     if abs(z[IDX_LND]) > THRESH["z_lnD"]:
         f.append(f"|z(lnD)| {abs(z[IDX_LND]):.1f} > {THRESH['z_lnD']}")
     if np.abs(z[K + 1:K + 5]).max() > THRESH["z_rate"]:
@@ -698,7 +649,7 @@ def _figure(res):
     a.set_title(f"Bartlett-1 grid-free  max|z|={gf['maxz']:.1f}")
     a = ax[1]
     zk = b1["z"]
-    lbl = [f"g{i}" for i in range(K)] + ["lnD"] + [n.split("_",1)[1] for n in RATE_NAMES]
+    lbl = [f"y{i}" for i in range(K)] + ["lnD"] + [n.split("_",1)[1] for n in RATE_NAMES]
     a.bar(range(P_DIM), zk, color="#1f77b4")
     for y in (-3, 3):
         a.axhline(y, color="k", lw=.6, ls=":")
@@ -762,20 +713,20 @@ def test_bartlett_fisher_equilibrium():
 # CLI
 # --------------------------------------------------------------------------- #
 def _pilot():
-    """Fast calibration: confirm cubic, basis linearity, crossings/photons."""
-    cfg = build_cfg()
-    theta = build_theta(g_true_knots())
+    """Fast calibration: confirm basis linearity, barrier, crossings/photons."""
+    from diff_fret_likelihood.simulator import eval_spline
     gnp = np.linspace(X_MIN, X_MAX, N_GRID)
-    B, b0 = build_force_basis(cfg, theta, gnp)
-    print("basis linearity:", selfcheck_linearity(cfg, theta, gnp, B, b0))
-    U = ground_truth_landscape(cfg, theta, gnp)
+    B = value_knot_basis(gnp); b0 = np.zeros(gnp.size)
+    print("basis vs GSL spline:", selfcheck_linearity(B, b0, gnp))
+    U = np.asarray(eval_spline(x_knots, y_true_knots(), gnp), dtype=np.float64)
     U = U - U.min()
-    inner = (gnp > 3.5) & (gnp < 11.5)
-    print("interior barrier (kT):", round(float(U[(gnp > 5) & (gnp < 8)].max()), 3))
-    np.random.seed(0)
-    batch, meta = simulate_traces(cfg, theta, "equilibrium", n_traces=4,
-                                  min_photons=50, max_photons=None, device="cpu")
-    print("photons/trace:", [int(x) for x in batch.lengths], meta["seconds"], "s")
+    print("interior barrier (kT):", round(float(U[(gnp > 5) & (gnp < 7)].max()), 3))
+    batch = dfl.simulate.simulate_equilibrium(
+        x_knots, y_true_knots(), D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB,
+        k_rb=K_RB, eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
+        T=TOTAL_TIME, dt=DT_SIM, N_max=N_MAX_PHOTONS,
+        n_traces=4, min_photons=50, n_workers=4, seed=0)
+    print("photons/trace:", batch.lengths.tolist())
 
 
 if __name__ == "__main__":

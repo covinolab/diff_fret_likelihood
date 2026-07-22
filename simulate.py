@@ -1,95 +1,46 @@
-"""Thin adapter around the ``smFRET_sbi`` Cython simulator (SPEC 7.7 / 13.6).
+"""Light wrapper around the in-project Cython simulator (``simulator.pyx``).
 
-We do NOT reimplement a simulator.  ``smFRET_sbi`` emits real photon streams
-(inter-photon times in ms + channels 0=green/1=red) for both ``equilibrium``
-and ``binding`` modes -- exactly the data contract the marked-point-process
-likelihood consumes.  This module:
+The notebooks and reliability scripts generate photon streams with the
+*in-project* ``smFRET_simulator`` (built via ``build_cython.py``), not the old
+external ``smFRET_sbi`` adapter.  This module provides the shared pieces:
 
-* puts ``smFRET_sbi/src`` first on ``sys.path`` (its ``simulator.py`` must win
-  the name clash with ``backup_fret_sbi/simulator.py``);
-* assembles the canonical parameter vector
-  ``[logD, g_0..g_{K-1}, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg]``;
-* runs the requested mode, collecting usable traces into padded batch tensors;
-* exposes the ground-truth landscape ``U(x)`` (via the simulator's own
-  force-knot integration) and the ground-truth ``EffectiveRates`` / crosstalk,
-  so recovery can be scored against the truth.
+* ``Batch`` -- padded batch of photon-stream traces (the data contract the
+  marked-point-process likelihood consumes);
+* ``_stack`` -- list of ``(ipt, colors)`` numpy arrays -> padded ``Batch``;
+* ``simulate_equilibrium`` -- a parallel rejection loop over ``smFRET_simulator``
+  (the pattern the notebooks previously duplicated inline), collecting usable
+  equilibrium traces into a ``Batch``.
+
+The simulator draws its start position from the Boltzmann equilibrium internally
+and parametrises ``U(x)`` directly by the potential *value* knots ``y_knots =
+U(x_knots)`` -- there is no ``x0`` argument.  Simulation is CPU-only (Cython);
+run it BEFORE any CUDA work.
 """
 
 from __future__ import annotations
 
-import sys
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 
-from .config import DTYPE, PhysicsConstants
-from .photophysics import EffectiveRates
+from .config import DTYPE
 
-SMFRET_SRC = "/home/dingeldein/Desktop/fret_sbi/smFRET_sbi/src"
-
-
-def _ensure_path():
-    if sys.path[:1] != [SMFRET_SRC]:
-        if SMFRET_SRC in sys.path:
-            sys.path.remove(SMFRET_SRC)
-        sys.path.insert(0, SMFRET_SRC)
+try:
+    from .simulator import smFRET_simulator
+except ImportError:
+    # The compiled `diff_fret_likelihood.simulator` extension may not be built
+    # (e.g. GSL missing at install time), so importing `diff_fret_likelihood`
+    # must not require it -- only `simulate_equilibrium` does, and its worker
+    # re-imports it lazily.
+    smFRET_simulator = None
 
 
 # ---------------------------------------------------------------------------
-# Canonical parameter vector
-# ---------------------------------------------------------------------------
-def assemble_theta(
-    knots, logD, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg
-) -> np.ndarray:
-    """Build the length-``(num_knots+9)`` canonical theta (numpy float64)."""
-    knots = np.asarray(knots, dtype=np.float64)
-    K = knots.size
-    theta = np.zeros(K + 9, dtype=np.float64)
-    theta[0] = logD
-    theta[1 : K + 1] = knots
-    theta[K + 1] = R0
-    theta[K + 2] = kD
-    theta[K + 3] = k_gb
-    theta[K + 4] = k_rb
-    theta[K + 5] = eta_g
-    theta[K + 6] = eta_r
-    theta[K + 7] = C_gr
-    theta[K + 8] = C_rg
-    return theta
-
-
-def physics_from_theta(theta, num_knots) -> dict:
-    K = num_knots
-    return dict(
-        logD=float(theta[0]),
-        D=float(10.0 ** theta[0]),
-        R0=float(theta[K + 1]),
-        kD=float(theta[K + 2]),
-        k_gb=float(theta[K + 3]),
-        k_rb=float(theta[K + 4]),
-        eta_g=float(theta[K + 5]),
-        eta_r=float(theta[K + 6]),
-        C_gr=float(theta[K + 7]),
-        C_rg=float(theta[K + 8]),
-    )
-
-
-def constants_from_theta(theta, num_knots, device="cpu") -> tuple[PhysicsConstants, EffectiveRates]:
-    p = physics_from_theta(theta, num_knots)
-    C_gr, C_rg = p["C_gr"], p["C_rg"]
-    consts = PhysicsConstants(
-        R0=p["R0"], C_gg=1.0 - C_gr, C_gr=C_gr, C_rg=C_rg, C_rr=1.0 - C_rg
-    )
-    rates = EffectiveRates.from_physics(
-        p["kD"], p["eta_g"], p["eta_r"], p["k_gb"], p["k_rb"], device=device
-    )
-    return consts, rates
-
-
-# ---------------------------------------------------------------------------
-# Simulation
+# Padded batch of traces
 # ---------------------------------------------------------------------------
 @dataclass
 class Batch:
@@ -133,81 +84,84 @@ def _stack(raw, max_photons, device):
     return Batch(ipt, colors, mask, lengths, Tvec).to(device)
 
 
-def simulate_traces(
-    cfg,
-    theta,
-    mode: str,
-    n_traces: int = 40,
-    min_photons: int = 50,
-    max_photons: int | None = 1500,
-    max_tries_factor: int = 8,
-    device="cpu",
-    verbose: bool = True,
-):
-    """Run the simulator and return ``(Batch, meta)``.
+# ---------------------------------------------------------------------------
+# Parallel equilibrium simulation (in-project Cython simulator)
+# ---------------------------------------------------------------------------
+def _simulate_chunk(share, budget, min_photons, seed, params):
+    """Local rejection loop -> up to ``share`` accepted ``(ipt, cols)`` traces.
 
-    ``cfg``   : path to a ``conf/simulator/*.yaml`` or an OmegaConf object.
-    ``theta`` : canonical parameter vector (numpy or 1-D tensor).
-    ``mode``  : 'equilibrium' or 'binding'.
-    Simulation is CPU-only (Cython); run it BEFORE any CUDA work.
+    Module-level so it is picklable for ``ProcessPoolExecutor``; imports the
+    Cython simulator inside the worker (no need to ship the compiled function).
     """
-    import time as _time
 
-    _ensure_path()
-    from simulator import (
-        smFRET_simulator_wrapper_from_config,
-        binding_simulator_wrapper_from_config,
-    )
+    sim = smFRET_simulator
+    if sim is None:                             # .so wasn't importable at package import
+        from .simulator import smFRET_simulator as sim
 
-    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
-    assert "smFRET_sbi" in sys.modules["simulator"].__file__, "wrong simulator.py on path"
+    np.random.seed(seed)                        # independent stream for this worker
+    (D, x_knots, y_knots, R0, kD, k_gb, k_rb,
+     eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, N_max, dt) = params
 
-    if mode == "equilibrium":
-        sim = smFRET_simulator_wrapper_from_config(cfg)
-    elif mode == "binding":
-        sim = binding_simulator_wrapper_from_config(cfg)
-    else:
-        raise ValueError(f"mode must be 'equilibrium' or 'binding', got {mode!r}")
-
-    theta_t = torch.as_tensor(np.asarray(theta, dtype=np.float64))
-    raw, tries = [], 0
-    t0 = _time.perf_counter()
-    while len(raw) < n_traces and tries < max_tries_factor * n_traces:
+    out, tries = [], 0
+    while len(out) < share and tries < budget:
         tries += 1
-        out = sim(theta_t)
-        if out is None:
+        G, R = sim(D, x_knots, y_knots, R0, kD, k_gb, k_rb,
+                   eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, N_max, dt)
+        if G is None:                            # aborted (left domain / budget)
             continue
-        ipt, chans, n = out
-        n = int(n)
-        if n < min_photons:
+        G = np.asarray(G, float); R = np.asarray(R, float)
+        times = np.concatenate([G, R])
+        cols = np.concatenate([np.zeros(G.size, int), np.ones(R.size, int)])
+        if times.size < min_photons:
             continue
-        raw.append((np.asarray(ipt, np.float64)[:n], np.asarray(chans)[:n]))
-    dt = _time.perf_counter() - t0
-    if verbose:
-        print(f"[{mode}] {len(raw)}/{n_traces} usable traces from {tries} tries "
-              f"in {dt:.1f}s")
+        o = np.argsort(times, kind="stable")
+        times, cols = times[o], cols[o]
+        ipt = np.empty_like(times); ipt[0] = 0.0; ipt[1:] = np.diff(times)   # ms
+        out.append((ipt, cols))
+    return out
+
+
+def simulate_equilibrium(
+    x_knots, y_knots, D, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg,
+    T, dt, N_max, *, n_traces, min_photons=50, max_tries_factor=4,
+    n_workers=None, seed=None, device="cpu", verbose=True,
+) -> Batch:
+    """Simulate ``n_traces`` equilibrium photon streams into a padded ``Batch``.
+
+    ``x_knots`` / ``y_knots`` are the potential value knots (``y_knots =
+    U(x_knots)``); ``D`` is nm^2/ms.  Crosstalk ``C_gg``/``C_rr`` are derived as
+    ``1 - C_gr`` / ``1 - C_rg``.  The start position is drawn from the Boltzmann
+    equilibrium inside the simulator -- there is no ``x0`` argument.  Runs a
+    fork-pool rejection loop (CPU-only; call BEFORE any CUDA work).
+    """
+    x_knots = np.asarray(x_knots, dtype=np.float64)
+    y_knots = np.asarray(y_knots, dtype=np.float64)
+    C_gg, C_rr = 1.0 - C_gr, 1.0 - C_rg
+
+    n_workers = max(1, min(n_workers or os.cpu_count(), n_traces))
+    # split target + budget across workers (keep the serial attempts/trace ratio)
+    shares = [n_traces // n_workers + (i < n_traces % n_workers) for i in range(n_workers)]
+    budgets = [max_tries_factor * s for s in shares]
+    # one independent RNG stream per worker
+    seeds = [int(s.generate_state(1)[0])
+             for s in np.random.SeedSequence(seed).spawn(n_workers)]
+
+    params = (D, x_knots, y_knots, R0, kD, k_gb, k_rb, eta_g, eta_r,
+              C_gg, C_rr, C_gr, C_rg, T, N_max, dt)
+
+    t0, raw = time.perf_counter(), []
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futs = [ex.submit(_simulate_chunk, sh, bd, min_photons, sd, params)
+                for sh, bd, sd in zip(shares, budgets, seeds)]
+        for f in as_completed(futs):
+            raw.extend(f.result())
+
+    raw = raw[:n_traces]                         # trim overshoot from remainder rounding
     if not raw:
-        raise RuntimeError(f"no usable {mode} traces produced")
-
-    batch = _stack(raw, max_photons, device)
-    meta = {
-        "mode": mode,
-        "tries": tries,
-        "seconds": dt,
-        "photon_counts": [len(i) for i, _ in raw],
-    }
-    return batch, meta
-
-
-# ---------------------------------------------------------------------------
-# Ground truth landscape
-# ---------------------------------------------------------------------------
-def ground_truth_landscape(cfg, theta, x_eval: np.ndarray) -> np.ndarray:
-    """True ``U(x)`` (min-zero) via the simulator's own force-knot integration."""
-    _ensure_path()
-    from utils import eval_free_energy_from_config
-
-    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
-    fe = eval_free_energy_from_config(cfg)
-    _, U = fe(np.asarray(theta, dtype=np.float64), np.asarray(x_eval, dtype=np.float64))
-    return U - U.min()
+        raise RuntimeError("no usable equilibrium traces produced")
+    batch = _stack(raw, max_photons=None, device=device)
+    if verbose:
+        pcts = np.percentile([len(i) for i, _ in raw], [0, 50, 100]).astype(int)
+        print(f"{len(raw)}/{n_traces} traces in {time.perf_counter()-t0:.1f}s | "
+              f"photons/trace min/med/max = {pcts} | workers={n_workers}")
+    return batch

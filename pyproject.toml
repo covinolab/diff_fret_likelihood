@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "Cython>=3.0", "numpy>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diff_fret_likelihood"
+dynamic = ["version"]
+description = "Differentiable smFRET marked-point-process likelihood for free-energy landscape, diffusion, and photophysics inference."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Covino Lab" }]
+keywords = [
+    "smFRET",
+    "single-molecule-FRET",
+    "likelihood",
+    "free-energy-landscape",
+    "diffusion",
+    "bayesian-inference",
+    "pytorch",
+    "cython",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Cython",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+]
+# NOTE: torch is a documented PREREQUISITE, deliberately NOT listed here --
+# pinning torch is fragile across CPU/CUDA builds and index URLs. Install the
+# right torch for your platform first (see README), then `pip install .`.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+sampling = ["pyro-ppl>=1.9"]            # sample.py HMC/NUTS (lazy import)
+diagnostics = ["arviz>=0.17"]           # R-hat / ESS diagnostics (lazy)
+dev = [
+    "pytest>=7",
+    "pyro-ppl>=1.9",
+    "arviz>=0.17",
+    "matplotlib>=3.7",                  # only test_bartlett_fisher.py figures (lazy)
+]
+
+[project.urls]
+Homepage = "https://github.com/covinolab/diff_fret_likelihood"
+Repository = "https://github.com/covinolab/diff_fret_likelihood.git"
+
+[tool.setuptools]
+packages = ["diff_fret_likelihood"]
+package-dir = { "diff_fret_likelihood" = "." }
+
+[tool.setuptools.package-data]
+diff_fret_likelihood = ["*.pyx", "*.pxd"]
+
+[tool.setuptools.dynamic]
+version = { attr = "diff_fret_likelihood._version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

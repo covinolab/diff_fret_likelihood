@@ -19,6 +19,8 @@ build/
 .ruff_cache/
 .coverage
 htmlcov/
+tests/_cache/            # cached Bartlett/Fisher simulation blobs (regenerable)
+tests/figures/           # test-generated figures
 
 # Environments
 .venv/

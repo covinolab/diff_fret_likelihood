@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # System prerequisite: GSL (not pip-installable) + pkg-config for discovery.
+      - name: Install GSL
+        run: sudo apt-get update && sudo apt-get install -y libgsl-dev pkg-config
+
+      # torch is a documented prerequisite (installed separately from the package
+      # deps); use the CPU wheel index so no CUDA is pulled on the runner.
+      - name: Install PyTorch (CPU)
+        run: pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package (with dev extras)
+        run: pip install ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest tests -q
