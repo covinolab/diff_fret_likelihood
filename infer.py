@@ -127,7 +127,6 @@ def fit(
         blurred = []
     else:
         raise ValueError(f"unknown blur {blur!r}")
-    blurred_ids = {id(p) for p in blurred}
 
     steps = optim.adam_steps
     n_polish = int(round(polish_frac * steps))
@@ -164,10 +163,10 @@ def fit(
 
         # --- graduated non-convexity: annealed gradient noise on the blur target ---
         sigma_n = _sigma_schedule(step, steps, n_polish, sigma0, noise_tau, noise_shape)
-        if sigma_n > 0 and blurred_ids:
+        if sigma_n > 0 and blurred:
             with torch.no_grad():
-                for p in params:
-                    if p.grad is None or id(p) not in blurred_ids:
+                for p in blurred:
+                    if p.grad is None:
                         continue
                     scale = p.grad.abs().mean() + 1e-12
                     p.grad.add_(sigma_n * scale * torch.randn(

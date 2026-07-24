@@ -171,6 +171,10 @@ class PriorConfig:
             raise ValueError(f"logD_std must be > 0, got {self.logD_std}")
         if self.l2_weight < 0:
             raise ValueError(f"l2_weight must be >= 0, got {self.l2_weight}")
+        if self.max_entropy_weight < 0:
+            raise ValueError(
+                f"max_entropy_weight must be >= 0, got {self.max_entropy_weight}"
+            )
         if self.gp_sigma is not None:
             if self.gp_sigma <= 0:
                 raise ValueError(f"gp_sigma must be > 0, got {self.gp_sigma}")
@@ -191,7 +195,7 @@ class PriorConfig:
         ``neg_log_posterior``; provided for callers that need a ``PriorConfig``
         instance rather than ``None``.
         """
-        return cls(curvature_weight=0.0, logD_mean=None, l2_weight=0.0, gp_sigma=None)
+        return cls()  # every field default is already the prior-off sentinel
 
     def active_terms(self) -> list[str]:
         """Names of the prior terms currently switched on (empty -> pure MLE)."""
@@ -204,6 +208,8 @@ class PriorConfig:
             terms.append("gp")
         if self.l2_weight:
             terms.append("l2")
+        if self.max_entropy_weight:
+            terms.append("max_entropy")
         return terms
 
     def describe(self) -> str:
@@ -214,7 +220,7 @@ class PriorConfig:
 
 @dataclass
 class OptimConfig:
-    """Adam warmup -> LBFGS polish (SPEC section 7.6)."""
+    """Adam optimisation with a graduated-non-convexity polish phase (SPEC section 7.6)."""
 
     adam_steps: int = 300
     adam_lr: float = 0.03

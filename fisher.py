@@ -67,7 +67,8 @@ from .generator import stationary
 from .objective import prior_penalty, gauge_penalty_from_offset
 from .photophysics import EffectiveRates
 
-_RATE_LOG_NAMES = ["log_a_g", "log_a_r", "log_bg_g", "log_bg_r"]
+_RATE_NAMES = ("a_g", "a_r", "bg_g", "bg_r")
+_RATE_LOG_NAMES = [f"log_{n}" for n in _RATE_NAMES]
 
 
 @dataclass
@@ -151,10 +152,10 @@ def _pack_truth_phi(potential, D, rates, device):
     phi = torch.empty(K + 5, dtype=DTYPE, device=device)
     phi[:K] = theta
     phi[K] = torch.log(torch.as_tensor(D, dtype=DTYPE, device=device))
-    phi[K + 1] = torch.log(torch.as_tensor(rates.a_g, dtype=DTYPE, device=device))
-    phi[K + 2] = torch.log(torch.as_tensor(rates.a_r, dtype=DTYPE, device=device))
-    phi[K + 3] = torch.log(torch.as_tensor(rates.bg_g, dtype=DTYPE, device=device))
-    phi[K + 4] = torch.log(torch.as_tensor(rates.bg_r, dtype=DTYPE, device=device))
+    for i, nm in enumerate(_RATE_NAMES):
+        phi[K + 1 + i] = torch.log(
+            torch.as_tensor(getattr(rates, nm), dtype=DTYPE, device=device)
+        )
     return phi
 
 
@@ -267,39 +268,30 @@ def _mean_hessian(phi, ipt, colors, mask, B, b0, grid, C, R0, jitter, pdt, p0, h
 # --------------------------------------------------------------------------- #
 # Gauge-aware pseudo-inverse
 # --------------------------------------------------------------------------- #
-def _gauge_pinv(F, rtol):
-    """Symmetric-PSD pseudo-inverse: drop singular values ≤ ``rtol·σ_max`` — the
-    exact landscape-gauge null direction, plus any genuinely data-unconstrained
-    directions (knots outside the FRET-observable window).
+def _svd_inverse(M, rtol, *, floor):
+    """Symmetric SVD (pseudo-)inverse of ``M``, returning ``(cov, n_small)``.
 
-    Uses the SVD (``gesdd``) rather than the symmetric eigensolver: the Fisher is
-    deliberately rank-deficient here (the gauge is an exact null direction and
-    edge-knot directions can be effectively unconstrained), and ``eigh``/``syevd``
-    fails to converge on such matrices while the SVD stays robust."""
-    F = 0.5 * (F + F.T)
-    U, S, Vh = torch.linalg.svd(F)                        # S descending
-    smax = S[0].clamp_min(torch.finfo(F.dtype).tiny)
-    keep = S > rtol * smax
-    inv = torch.where(keep, 1.0 / S, torch.zeros_like(S))
-    cov = (Vh.T * inv) @ U.T                              # V Σ⁺ Uᵀ = pinv(F)
-    return 0.5 * (cov + cov.T), int((~keep).sum())
+    Uses the SVD (``gesdd``) rather than the symmetric eigensolver: these matrices
+    are deliberately rank-deficient / ill-conditioned (the gauge is an exact null
+    direction and edge-knot directions can be effectively unconstrained), and
+    ``eigh``/``syevd`` fails to converge on them while the SVD stays robust.
 
-
-def _floored_inverse(P, rtol):
-    """Robust inverse of a (proper, near-PD) precision matrix.
-
-    Unlike ``_gauge_pinv`` (which DROPS sub-``rtol`` directions -> zero variance, the
-    right thing for the exactly-unidentified likelihood gauge), this FLOORS the
-    singular values at ``rtol·σ_max``: it bounds the condition number for numerical
-    safety but keeps every direction, so a weakly-but-properly-pinned posterior
-    direction retains its (large but finite) variance instead of being zeroed."""
-    P = 0.5 * (P + P.T)
-    U, S, Vh = torch.linalg.svd(P)
-    smax = S[0].clamp_min(torch.finfo(P.dtype).tiny)
-    n_floored = int((S < rtol * smax).sum())
-    S = torch.clamp(S, min=rtol * smax)
-    cov = (Vh.T * (1.0 / S)) @ U.T
-    return 0.5 * (cov + cov.T), n_floored
+    Singular values ``≤ rtol·σ_max`` are treated as null. ``floor=False`` (the
+    pseudo-inverse) DROPS them -> zero variance, the right thing for the exactly-
+    unidentified likelihood gauge; ``floor=True`` instead FLOORS them at ``rtol·σ_max``,
+    bounding the condition number for numerical safety while keeping every direction so
+    a weakly-but-properly-pinned posterior direction retains its (large but finite)
+    variance instead of being zeroed.  ``n_small`` counts the affected directions."""
+    M = 0.5 * (M + M.T)
+    U, S, Vh = torch.linalg.svd(M)                        # S descending
+    smax = S[0].clamp_min(torch.finfo(M.dtype).tiny)
+    small = S <= rtol * smax
+    if floor:
+        inv = 1.0 / torch.clamp(S, min=rtol * smax)
+    else:
+        inv = torch.where(small, torch.zeros_like(S), 1.0 / S)
+    cov = (Vh.T * inv) @ U.T                              # V Σ⁺ Uᵀ
+    return 0.5 * (cov + cov.T), int(small.sum())
 
 
 # --------------------------------------------------------------------------- #
@@ -459,10 +451,10 @@ def cramer_rao_bound(
         # posterior information = Fisher + prior Hessian (the Laplace precision).
         Hprior = _prior_hessian(phi, potential, grid, prior, K, gauge_sd, rate_sd)
         posterior_precision = 0.5 * ((fisher + Hprior) + (fisher + Hprior).T)
-        cov, null_dim = _floored_inverse(posterior_precision, gauge_rtol)
+        cov, null_dim = _svd_inverse(posterior_precision, gauge_rtol, floor=True)
     else:
         posterior_precision = None
-        cov, null_dim = _gauge_pinv(fisher, gauge_rtol)
+        cov, null_dim = _svd_inverse(fisher, gauge_rtol, floor=False)
     sigma = torch.sqrt(torch.diag(cov).clamp_min(0.0))
 
     param_names = [f"knot_{i}" for i in range(K)] + ["logD"] + _RATE_LOG_NAMES
@@ -472,11 +464,9 @@ def cramer_rao_bound(
     sigma_physical = {
         "knots": sig[:K].numpy(),                         # kT (per knot)
         "D": D_true * float(sig[K]),                      # nm²/ms
-        "a_g": float(rates.a_g) * float(sig[K + 1]),      # kHz
-        "a_r": float(rates.a_r) * float(sig[K + 2]),
-        "bg_g": float(rates.bg_g) * float(sig[K + 3]),
-        "bg_r": float(rates.bg_r) * float(sig[K + 4]),
     }
+    for i, nm in enumerate(_RATE_NAMES):                  # kHz, delta method
+        sigma_physical[nm] = float(getattr(rates, nm)) * float(sig[K + 1 + i])
 
     rel_frob = None
     if validate:

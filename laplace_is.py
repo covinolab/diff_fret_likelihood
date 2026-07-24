@@ -40,7 +40,7 @@ import torch
 from torch.func import functional_call
 
 from .config import DTYPE
-from .sample import build_log_prob, PosteriorSamples, N_RATES
+from .sample import build_log_prob, PosteriorSamples, N_RATES, _unflatten
 
 __all__ = ["laplace_importance_samples", "LaplaceProposal"]
 
@@ -304,22 +304,13 @@ def _pushforward(z, potential, grid, info):
         rows = []
         with torch.no_grad():
             for s in range(theta.shape[0]):
-                pdict = _unflatten_bare(theta[s], specs)
+                pdict = _unflatten(theta[s], specs)
                 rows.append(functional_call(potential, pdict, args=(grid,)))
         U = torch.stack(rows)
     U = U - U.mean(dim=1, keepdim=True)                 # grid-mean-zero gauge
     D = z[:, npot].exp()
     rates = z[:, npot + 1:npot + 1 + N_RATES].exp()
     return U, D, rates, theta.clone()
-
-
-def _unflatten_bare(flat, specs):
-    """Flat potential slice -> {bare_param_name: view} for ``functional_call``."""
-    out, ptr = {}, 0
-    for name, shape, numel in specs:
-        out[name] = flat[ptr:ptr + numel].view(shape)
-        ptr += numel
-    return out
 
 
 # --------------------------------------------------------------------------- #
