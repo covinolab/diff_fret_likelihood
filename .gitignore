@@ -12,6 +12,7 @@ simulator.c
 build/
 *.egg-info/
 .eggs/
+.pt
 
 # Test / tooling caches
 .pytest_cache/
