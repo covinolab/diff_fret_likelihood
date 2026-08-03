@@ -3,8 +3,6 @@
 * ``curvature_penalty`` -- discrete-curvature smoothness prior on ``u`` (SPEC 9).
 * ``prior_penalty`` -- the single aggregated ``-log prior`` term (``None`` -> MLE).
 * ``neg_log_posterior`` -- marginal-likelihood-based training objective.
-* ``complete_data_loglik`` -- SECONDARY joint objective with the path as a
-  latent variable (SPEC 4.5), used for the joint-vs-marginal D-bias diagnostic.
 """
 
 from __future__ import annotations
@@ -16,10 +14,13 @@ import torch
 from . import potential as dfl_potential
 
 from .config import PriorConfig
-from .dynamics import em_transition_logp
 from .forward import marginal_loglik_batch, _BasePotential_on_grid
 from .generator import stationary
-from .photophysics import emission_rates, EffectiveRates
+
+
+def _scalar_zero(ref: torch.Tensor) -> torch.Tensor:
+    """A 0-d zero matching ``ref``'s dtype/device (empty penalty terms)."""
+    return torch.zeros((), dtype=ref.dtype, device=ref.device)
 
 
 def curvature_penalty(u_grid: torch.Tensor, dx: float = 1.0) -> torch.Tensor:
@@ -57,7 +58,7 @@ def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor) -> torc
 
 def logD_penalty(D: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
     if prior.logD_mean is None:
-        return torch.zeros((), dtype=D.dtype, device=D.device)
+        return _scalar_zero(D)
     logD = torch.log(D)
     return 0.5 * ((logD - prior.logD_mean) / prior.logD_std) ** 2
 
@@ -105,7 +106,7 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     constant (raw loss values are therefore not comparable across GP settings).
     """
     if prior.gp_sigma is None:
-        return torch.zeros((), dtype=grid.dtype, device=grid.device)
+        return _scalar_zero(grid)
     n = int(min(max(prior.gp_n_ctrl, 4), grid.shape[0]))
     x_ctrl = torch.linspace(
         float(grid.min()), float(grid.max()), n, dtype=grid.dtype, device=grid.device
@@ -120,18 +121,17 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     # Fixed jitter; deterministic escalation only if Cholesky fails (inputs are
     # constant within a fit, so the landed jitter is stationary across calls).
     jit = float(prior.gp_jitter)
-    L = None
     for _ in range(6):
         try:
             L = torch.linalg.cholesky(Kc + jit * eye)
             break
         except RuntimeError:
             jit *= 10.0
-    if L is None:  # pragma: no cover - pathological kernel
+    else:  # pragma: no cover - pathological kernel
         raise RuntimeError("GP kernel Cholesky failed even after jitter escalation")
 
     z = torch.linalg.solve_triangular(L, r.unsqueeze(-1), upper=False)
-    return 0.5 * (z.squeeze(-1) @ z.squeeze(-1)) / (prior.gp_sigma ** 2)
+    return 0.5 * (z ** 2).sum() / (prior.gp_sigma ** 2)
 
 
 def max_entropy_penalty(potential, D, grid: torch.Tensor) -> torch.Tensor:
@@ -192,20 +192,20 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -
     both cleaner and slightly cheaper.
     """
     if prior is None:
-        return torch.zeros((), dtype=grid.dtype, device=grid.device)
-    
+        return _scalar_zero(grid)
+
+    reg = _scalar_zero(grid)
     if prior.curvature_weight:
         if isinstance(potential, dfl_potential.SplinePotential):
-            reg = prior.curvature_weight * curvature_penalty_spline(
+            reg = reg + prior.curvature_weight * curvature_penalty_spline(
                 potential.theta, potential.knots_x
             )
         else:
             u_grid = _BasePotential_on_grid(potential, grid)
             dx = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
-            reg = prior.curvature_weight * curvature_penalty(u_grid, dx)
-    else:
-        reg = torch.zeros((), dtype=grid.dtype, device=grid.device)
-        
+            reg = reg + prior.curvature_weight * curvature_penalty(u_grid, dx)
+    if prior.logD_mean is not None:
+        reg = reg + logD_penalty(D, prior)
     if prior.gp_sigma is not None:
         reg = reg + gp_penalty(potential, grid, prior)
     if prior.l2_weight:

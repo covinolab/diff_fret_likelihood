@@ -111,6 +111,16 @@ extensions = [
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
     ),
+    Extension(
+        name="diff_fret_likelihood.doob_tpt",  # Doob h-transform TPT sampler
+        sources=["doob_tpt.pyx"],
+        libraries=["gsl", "gslcblas", "m"],
+        include_dirs=[np.get_include(), *gsl_inc],
+        library_dirs=gsl_lib,
+        runtime_library_dirs=gsl_lib,  # rpath: import without LD_LIBRARY_PATH
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
+    ),
 ]
 
 ext_modules = cythonize(
