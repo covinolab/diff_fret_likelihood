@@ -134,20 +134,6 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     return 0.5 * (z ** 2).sum() / (prior.gp_sigma ** 2)
 
 
-def max_entropy_penalty(potential, D, grid: torch.Tensor) -> torch.Tensor:
-    """Raw max-entropy penalty ``D * sum w du^2 / h^2`` (weight applied by the caller).
-
-    Offset-invariant in ``u`` (``pi`` is normalised, ``du`` is a difference), so the
-    gauge-fixed ``_BasePotential_on_grid`` value used by the sibling penalties is fine.
-    """
-    u = _BasePotential_on_grid(potential, grid)
-    h = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
-    pi = stationary(u)                     # Boltzmann stationary mass, sums to 1
-    du = u[1:] - u[:-1]                    # (G-1,) edge drops
-    w = torch.sqrt(pi[1:] * pi[:-1])       # geometric-mean edge weight
-    return D * (w * du ** 2).sum() / h ** 2
-
-
 def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
     """The pure-gauge offset coordinate of ``U`` (the exact flat likelihood direction).
 
