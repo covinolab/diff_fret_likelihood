@@ -12,9 +12,17 @@ Two interchangeable parameterisations behind one interface:
   free knot heights.  Low-dimensional and very stable; used to cross-check the
   MLP and as a robust fallback.
 
-Gauge fixing (subtract the min) is applied wherever ``u_grid`` feeds the
-generator/stationary distribution; the additive constant is pure gauge and
-must not change any observable (``tests/test_potential.py``).
+The additive constant of ``u`` is pure gauge and must not change any observable
+(``tests/test_potential.py``).  Three distinct mechanisms exploit that, and they
+are not interchangeable:
+
+* ``generator.min_gauge`` -- subtract the min wherever ``u`` feeds ``exp(-u)``.  An
+  overflow guard, applied inside the likelihood.
+* ``objective.gauge_penalty`` -- the Gaussian anchor on ``mean(theta)``, which removes
+  the flat direction so optimisers converge and the Fisher is invertible.
+* ``infer.recovered_potential`` -- grid-mean-zero, for reporting only.
+
+This module holds none of them; it just parameterises ``u``.
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ _ACTIVATIONS = {
 
 
 class _BasePotential(nn.Module):
-    """Common force / on-grid / gauge machinery."""
+    """Common force / on-grid machinery."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError
@@ -54,11 +62,6 @@ class _BasePotential(nn.Module):
 
     def on_grid(self, grid: torch.Tensor) -> torch.Tensor:
         return self.forward(grid)
-
-    @staticmethod
-    def gauge_fix(u_grid: torch.Tensor) -> torch.Tensor:
-        """Pure gauge: pin the minimum to zero."""
-        return u_grid - u_grid.min()
 
 
 class MLPPotential(_BasePotential):

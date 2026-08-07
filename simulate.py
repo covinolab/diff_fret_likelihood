@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -87,8 +88,14 @@ def _stack(raw, max_photons, device):
 # ---------------------------------------------------------------------------
 # Parallel equilibrium simulation (in-project Cython simulator)
 # ---------------------------------------------------------------------------
-def _simulate_chunk(share, budget, min_photons, seed, params):
+def _simulate_chunk(share, budget, seed, params):
     """Local rejection loop -> up to ``share`` accepted ``(ipt, cols)`` traces.
+
+    The ONLY rejection is the walker leaving the spline domain.  There is deliberately
+    no photon-count floor: the count is *determined* by the photophysics parameters, so
+    cutting on it would truncate the count distribution while still returning a
+    full-count pool -- a silent bias in anything estimated from the traces (the Fisher
+    above all).  The simulator sizes its own buffers, so there is no upper cut either.
 
     Module-level so it is picklable for ``ProcessPoolExecutor``; imports the
     Cython simulator inside the worker (no need to ship the compiled function).
@@ -100,30 +107,34 @@ def _simulate_chunk(share, budget, min_photons, seed, params):
 
     np.random.seed(seed)                        # independent stream for this worker
     (D, x_knots, y_knots, R0, kD, k_gb, k_rb,
-     eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, N_max, dt) = params
+     eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, dt) = params
 
-    out, tries = [], 0
+    out, tries, n_empty = [], 0, 0
     while len(out) < share and tries < budget:
         tries += 1
         G, R = sim(D, x_knots, y_knots, R0, kD, k_gb, k_rb,
-                   eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, N_max, dt)
-        if G is None:                            # aborted (left domain / budget)
+                   eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, dt)
+        if G is None:                            # aborted: walker left the domain
             continue
         G = np.asarray(G, float); R = np.asarray(R, float)
         times = np.concatenate([G, R])
         cols = np.concatenate([np.zeros(G.size, int), np.ones(R.size, int)])
-        if times.size < min_photons:
+        if times.size == 0:
+            # Not a count cut: a trace with no photons has no inter-photon times at
+            # all, and would enter the batch as an all-masked row that silently
+            # contributes nothing to the likelihood.  Counted and reported upstream.
+            n_empty += 1
             continue
         o = np.argsort(times, kind="stable")
         times, cols = times[o], cols[o]
-        ipt = np.empty_like(times); ipt[0] = 0.0; ipt[1:] = np.diff(times)   # ms
+        ipt = np.zeros(times.size); ipt[1:] = np.diff(times)                 # ms
         out.append((ipt, cols))
-    return out
+    return out, n_empty
 
 
 def simulate_equilibrium(
     x_knots, y_knots, D, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg,
-    T, dt, N_max, *, n_traces, min_photons=50, max_tries_factor=4,
+    T, dt, *, n_traces, max_tries_factor=4,
     n_workers=None, seed=None, device="cpu", verbose=True,
 ) -> Batch:
     """Simulate ``n_traces`` equilibrium photon streams into a padded ``Batch``.
@@ -133,6 +144,11 @@ def simulate_equilibrium(
     ``1 - C_gr`` / ``1 - C_rg``.  The start position is drawn from the Boltzmann
     equilibrium inside the simulator -- there is no ``x0`` argument.  Runs a
     fork-pool rejection loop (CPU-only; call BEFORE any CUDA work).
+
+    The photon-count distribution is returned untruncated at both ends: the simulator
+    sizes its own arrival-time buffers (no upper cut) and there is no count floor (see
+    ``_simulate_chunk``).  Traces are lost only to the walker leaving the spline domain,
+    and a short pool warns rather than passing silently.
     """
     x_knots = np.asarray(x_knots, dtype=np.float64)
     y_knots = np.asarray(y_knots, dtype=np.float64)
@@ -147,18 +163,37 @@ def simulate_equilibrium(
              for s in np.random.SeedSequence(seed).spawn(n_workers)]
 
     params = (D, x_knots, y_knots, R0, kD, k_gb, k_rb, eta_g, eta_r,
-              C_gg, C_rr, C_gr, C_rg, T, N_max, dt)
+              C_gg, C_rr, C_gr, C_rg, T, dt)
 
-    t0, raw = time.perf_counter(), []
+    t0, raw, n_empty = time.perf_counter(), [], 0
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futs = [ex.submit(_simulate_chunk, sh, bd, min_photons, sd, params)
+        futs = [ex.submit(_simulate_chunk, sh, bd, sd, params)
                 for sh, bd, sd in zip(shares, budgets, seeds)]
         for f in as_completed(futs):
-            raw.extend(f.result())
+            chunk, n_e = f.result()
+            raw.extend(chunk)
+            n_empty += n_e
 
     raw = raw[:n_traces]                         # trim overshoot from remainder rounding
     if not raw:
         raise RuntimeError("no usable equilibrium traces produced")
+    if len(raw) < n_traces:
+        warnings.warn(
+            f"simulate_equilibrium: {len(raw)} of {n_traces} traces produced -- the "
+            f"rejection budget ({max_tries_factor} attempts per trace) ran out. Traces "
+            f"are rejected only for leaving the spline domain [{x_knots[0]:.3g}, "
+            f"{x_knots[-1]:.3g}], so widen the knot domain or shorten T. The returned "
+            f"pool is smaller than requested, NOT a biased draw of the requested size.",
+            RuntimeWarning, stacklevel=2,
+        )
+    if n_empty:
+        warnings.warn(
+            f"simulate_equilibrium: dropped {n_empty} trace(s) with zero photons (no "
+            f"inter-photon times to represent). The emission rates are low enough that "
+            f"empty traces are likely, so the returned count distribution IS truncated "
+            f"at zero -- raise kD, the background rates, or T.",
+            RuntimeWarning, stacklevel=2,
+        )
     batch = _stack(raw, max_photons=None, device=device)
     if verbose:
         pcts = np.percentile([len(i) for i, _ in raw], [0, 50, 100]).astype(int)

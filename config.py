@@ -160,8 +160,6 @@ class PriorConfig:
     gp_mean: "torch.Tensor | None" = None  # [G] on the grid; interp'd to x_ctrl; None -> 0
     gp_jitter: float = 1e-6            # relative to the correlation matrix (FIXED)
 
-    max_entropy_weight: float = 0.0  # weight for the max-entropy penalty (D * sum w du^2 / h^2)
-
     def __post_init__(self):
         if self.curvature_weight < 0:
             raise ValueError(
@@ -171,10 +169,6 @@ class PriorConfig:
             raise ValueError(f"logD_std must be > 0, got {self.logD_std}")
         if self.l2_weight < 0:
             raise ValueError(f"l2_weight must be >= 0, got {self.l2_weight}")
-        if self.max_entropy_weight < 0:
-            raise ValueError(
-                f"max_entropy_weight must be >= 0, got {self.max_entropy_weight}"
-            )
         if self.gp_sigma is not None:
             if self.gp_sigma <= 0:
                 raise ValueError(f"gp_sigma must be > 0, got {self.gp_sigma}")
@@ -208,8 +202,6 @@ class PriorConfig:
             terms.append("gp")
         if self.l2_weight:
             terms.append("l2")
-        if self.max_entropy_weight:
-            terms.append("max_entropy")
         return terms
 
     def describe(self) -> str:

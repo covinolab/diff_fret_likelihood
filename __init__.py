@@ -30,6 +30,7 @@ from .objective import curvature_penalty, prior_penalty, neg_log_posterior
 from .dynamics import em_transition_logp
 from .infer import fit, fit_multi, FitResult, FreeRates, recovered_potential
 from .fisher import cramer_rao_bound, CRBResult
+from .reconstruct import reconstruct_trace, reconstruct_batch, Reconstruction
 from . import simulate
 from . import init
 from . import sample
@@ -48,5 +49,6 @@ __all__ = [
     "curvature_penalty", "prior_penalty", "neg_log_posterior",
     "em_transition_logp", "fit", "fit_multi", "FitResult", "FreeRates",
     "recovered_potential", "cramer_rao_bound", "CRBResult",
+    "reconstruct_trace", "reconstruct_batch", "Reconstruction",
     "simulate", "init", "sample",
 ]

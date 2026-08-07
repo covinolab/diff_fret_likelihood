@@ -134,19 +134,40 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     return 0.5 * (z ** 2).sum() / (prior.gp_sigma ** 2)
 
 
-def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
-    """The pure-gauge offset coordinate of ``U`` (the exact flat likelihood direction).
+def gauge_offset_from_theta(theta: torch.Tensor) -> torch.Tensor:
+    """The pure-gauge offset coordinate of a spline landscape, from its knots alone.
 
     The marginal likelihood is exactly invariant to ``U -> U + const``.  For a
     ``SplinePotential`` (natural cubic, ``u = M_val @ theta`` with ``M_val`` a
     partition of unity) that flat direction is ``(1,...,1)`` in ``theta``-space, so
     ``mean(theta)`` is the offset whose gradient points *exactly* along it -- anchoring
     it therefore pins the gauge with ZERO bias on the identified shape (well depths,
-    barriers, ``D``).  For the MLP (no knots) we fall back to ``mean(U over grid)``.
+    barriers, ``D``).
+
+    Takes the knot tensor rather than the potential object because the two places that
+    need it most -- ``sample.build_log_prob`` and ``fisher._penalty_hessian`` -- hold a
+    swapped-in ``theta`` slice, not a live module.  This is the ONE definition of the
+    offset; ``gauge_offset`` below is the potential-level convenience wrapper.
+    """
+    return theta.mean()
+
+
+def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
+    """The pure-gauge offset coordinate of ``U``, from a potential object.
+
+    Delegates to ``gauge_offset_from_theta`` for a spline (the exact flat direction).
+
+    For the MLP (no knots) it falls back to ``mean(U over grid)``, which is NOT an exact
+    flat direction in parameter space -- an MLP cannot in general realise ``U + const``
+    by moving along one parameter direction -- so anchoring it can bias the recovered
+    shape slightly.  ``infer.fit`` accepts that trade for the sake of a converging
+    optimiser; ``sample.build_log_prob`` instead drops the anchor entirely for
+    non-splines.  That asymmetry is deliberate, and moot in practice: no live script
+    fits an MLP, and ``fisher.cramer_rao_bound`` rejects one outright.
     """
     if hasattr(potential, "theta"):          # spline: exact flat direction
-        return potential.theta.mean()
-    return potential.on_grid(grid).mean()     # MLP fallback
+        return gauge_offset_from_theta(potential.theta)
+    return potential.on_grid(grid).mean()     # MLP fallback (approximate; see above)
 
 
 def gauge_penalty_from_offset(offset: torch.Tensor, gauge_sd: float = 1.0) -> torch.Tensor:
@@ -197,8 +218,6 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -
     if prior.l2_weight:
         pnorm = sum((p ** 2).sum() for p in potential.parameters())
         reg = reg + prior.l2_weight * pnorm
-    if prior.max_entropy_weight:
-        reg = reg + prior.max_entropy_weight * max_entropy_penalty(potential, D, grid)
     return reg
 
 

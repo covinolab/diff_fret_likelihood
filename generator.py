@@ -25,6 +25,23 @@ import torch
 from .config import DTYPE
 
 
+def min_gauge(u_grid: torch.Tensor) -> torch.Tensor:
+    """``u - u.min()``: the overflow guard applied wherever ``u`` feeds ``exp(-u)``.
+
+    This is NOT an identifiability fix and has nothing to do with the gauge *anchor*
+    (``objective.gauge_penalty``) or with the grid-mean-zero *reporting* gauge
+    (``infer.recovered_potential``).  It exists only so ``exp(-u)`` cannot overflow when
+    the grid reaches into a deep well, and it is safe precisely because the likelihood is
+    exactly invariant to ``u -> u + const``: subtracting the min changes no observable.
+    Needed regardless of whether an anchor is in play.
+
+    The single definition, used by ``stationary`` here, ``forward._BasePotential_on_grid``
+    and ``fisher._single_logL`` (which works on a raw ``u`` tensor, not a potential
+    object, hence a free function rather than a method).
+    """
+    return u_grid - u_grid.min()
+
+
 def smoluchowski(u_grid: torch.Tensor, D: torch.Tensor, dx: float) -> torch.Tensor:
     """Build ``L`` of shape ``[G, G]`` (column-sum-zero generator).
 
@@ -56,7 +73,11 @@ def smoluchowski(u_grid: torch.Tensor, D: torch.Tensor, dx: float) -> torch.Tens
 
 
 def sqrt_pi(u_grid: torch.Tensor) -> torch.Tensor:
-    """``s_i = e^{-u_i/2}`` (unnormalised sqrt of the Boltzmann weight)."""
+    """``s_i = e^{-u_i/2}`` (unnormalised sqrt of the Boltzmann weight).
+
+    Deliberately does NOT apply ``min_gauge``: its only consumer, ``symmetrize``, forms
+    ``s_i / s_j`` ratios, in which any constant shift cancels exactly.
+    """
     return torch.exp(-u_grid / 2.0)
 
 
@@ -71,7 +92,7 @@ def symmetrize(
 
 def stationary(u_grid: torch.Tensor) -> torch.Tensor:
     """Normalised Boltzmann stationary distribution ``pi_i propto e^{-u_i}``."""
-    w = torch.exp(-(u_grid - u_grid.min()))
+    w = torch.exp(-min_gauge(u_grid))
     return w / w.sum()
 
 

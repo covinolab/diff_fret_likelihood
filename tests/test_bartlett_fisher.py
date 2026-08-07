@@ -92,7 +92,6 @@ N_GRID = 160
 
 LOG10_D = float(np.log10(10.0))                          # D = 10 nm^2/ms
 TOTAL_TIME = float(os.environ.get("BARTLETT_TT", "150.0"))  # ms (many crossings)
-N_MAX_PHOTONS = 30000                                    # per-channel budget (never truncates)
 DT_SIM = 5.0e-6                                          # Langevin integration step (ms)
 
 # photophysics (realistic rung): kD=6, eta=.85, backgrounds, crosstalk
@@ -258,7 +257,7 @@ def single_logL_u(u, ipt, colors, mask, D, rates, grid, C, R0, dx, jitter=1e-12,
 def _cache_key(y_knots, log10_D, n_traces):
     h = hashlib.sha1()
     for a in (np.round(y_knots, 8), np.round(x_knots, 8),
-              np.array([log10_D, TOTAL_TIME, N_MAX_PHOTONS, DT_SIM, N_GRID,
+              np.array([log10_D, TOTAL_TIME, DT_SIM, N_GRID,
                         R0, KD, ETA_G, ETA_R, K_GB, K_RB, C_GR, C_RG])):
         h.update(np.ascontiguousarray(a, np.float64).tobytes())
     h.update(f"{n_traces}|s{SEED_OFFSET}".encode())
@@ -283,8 +282,8 @@ def simulate_cached(n_traces, n_workers=24, verbose=True):
     batch = dfl.simulate.simulate_equilibrium(
         x_knots, y_knots, D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB, k_rb=K_RB,
         eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
-        T=TOTAL_TIME, dt=DT_SIM, N_max=N_MAX_PHOTONS,
-        n_traces=n_traces, min_photons=50, n_workers=n_workers, seed=SEED_OFFSET,
+        T=TOTAL_TIME, dt=DT_SIM,
+        n_traces=n_traces, n_workers=n_workers, seed=SEED_OFFSET,
         device="cpu", verbose=verbose)
     ipt, colors, mask, lengths = batch.ipt, batch.colors, batch.mask, batch.lengths
     torch.save({"ipt": ipt, "colors": colors, "mask": mask, "lengths": lengths},
@@ -724,8 +723,8 @@ def _pilot():
     batch = dfl.simulate.simulate_equilibrium(
         x_knots, y_true_knots(), D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB,
         k_rb=K_RB, eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
-        T=TOTAL_TIME, dt=DT_SIM, N_max=N_MAX_PHOTONS,
-        n_traces=4, min_photons=50, n_workers=4, seed=0)
+        T=TOTAL_TIME, dt=DT_SIM,
+        n_traces=4, n_workers=4, seed=0)
     print("photons/trace:", batch.lengths.tolist())
 
 

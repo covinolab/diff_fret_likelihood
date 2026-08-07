@@ -1,38 +1,27 @@
-"""Data-driven and external initializers for the marginal-likelihood fit.
+"""Initializers for the marginal-likelihood fit.
 
 The marginal objective ``-log p`` is non-convex in the landscape parameters, so a
-good starting point matters (SPEC section 7.6).  This module provides, as pure
-helpers used *before* ``fit`` (no change to the fit path):
+good starting point matters.  Both helpers here are pure, used *before* ``fit``, and
+change nothing in the fit path itself:
 
-* ``occupancy_hist_init`` -- landscape warm-start ``u ~= -log(pi_hist)`` from the
-  FRET-efficiency histogram (the fast-photon binned limit): bin photons, read off
-  the apparent efficiency per window, map ``E -> x`` through the inverse Foerster
-  relation, histogram over the grid, and take the negative-log occupancy.
-* ``estimate_D_init`` -- a rough diffusion coefficient from the apparent-``x``
-  autocorrelation time via the overdamped (OU) relation ``D = Var(x) / tau_c``.
-* ``resolve_u_target`` / ``warmstart_potential`` -- apply *either* a data-driven
-  profile *or* an external one (a grid array, an ``(x, u)`` pair on arbitrary
-  points, or a callable ``u(x)``) to any potential.
+* ``warmstart_potential`` -- set a potential so ``potential.on_grid(grid) ~= u_target``
+  for an externally supplied ``[G]`` profile.  Exact (least squares) for a
+  ``SplinePotential``, which is linear in its knots; a short Adam regression for any
+  other potential.
+* ``estimate_rates`` -- rough initial ``EffectiveRates`` from a photon ``Batch``.  Only
+  the per-channel *total* rate is observable from a photon stream, so this is a
+  starting point for ``fit(fit_rates=True)``, not a calibration.
 
-Usage (no fit change; external ``D`` is just the existing ``D_init`` float)::
+Usage::
 
     from diff_fret_likelihood import init
-    init.warmstart_potential(pot, grid, init.occupancy_hist_init(batch, grid, R0))
-    D0 = init.estimate_D_init(batch, grid, R0)          # or an external float
-    # external profile instead:
-    init.warmstart_potential(pot, grid, init.resolve_u_target((x_ext, u_ext), grid, R0))
+    init.warmstart_potential(pot, grid, u_target)        # u_target: [G] tensor/array
+    rates = init.estimate_rates(batch, bg_frac=0.5, device=device)
     res = dfl.fit(batch, grid, pot, C, R0, D_init=D0, rates_init=rates, prior=prior)
-
-These estimates are deliberately *rough* (the apparent efficiency is biased by
-crosstalk/background and the binning has its own timescale); they are starting
-points refined by the fit.
 """
 
 from __future__ import annotations
 
-import math
-
-import numpy as np
 import torch
 
 from .config import DTYPE

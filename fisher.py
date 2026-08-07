@@ -23,23 +23,37 @@ photophysics rates scored together.  Positives are scored in natural-log space
 by the delta method (``σ_D = D·σ_lnD`` etc.).
 
 Gauge: the likelihood is exactly invariant to ``U → U + const``, so the
-all-knots-equal direction is an exact null-space of the Fisher matrix.  The
-covariance is therefore the pseudo-inverse restricted to the informative
-subspace — i.e. the landscape bound is reported in the sum-to-zero gauge (each
-knot's σ is relative to the mean level).  This is the SAME gauge ``infer.fit``
-now *enforces* (its ``mean(theta)=0`` anchor) and the sampler anchors, so the CRB
-σ and the fit/posterior spread are directly comparable.  (``recovered_potential``
-reports the grid-mean-zero gauge, which differs by a constant only — shape and
-per-knot σ are unaffected.)
+all-knots-equal direction is an exact null-space of the Fisher matrix.  The Gaussian
+gauge anchor (``gauge_sd``) that ``infer.fit`` and the sampler apply is therefore
+**always** added here too, independently of whether a ``PriorConfig`` prior is in
+play: it is a choice of coordinates, not a belief about physics, and without it the
+matrix to invert is genuinely singular and only an SVD threshold stands between the
+caller and a meaningless number.  With it, the information matrix is normally
+positive definite and is inverted EXACTLY by Cholesky — no threshold anywhere.
 
-Identifiability: the *pure* (prior-free) CRB is finite only on the identifiable
-subspace.  Landscape directions the data don't constrain — the gauge, plus any
-knots outside the FRET-observable window — are dropped by the pseudo-inverse;
-``null_dim`` counts them (``1`` = gauge only).  When ``null_dim > 1`` the σ of a
-knot lying in a dropped direction is a *lower bound* (the pseudo-inverse gives it
-no variance from that direction), so inspect the returned Fisher diagonal to see
-which knots are informed.  Add a landscape prior (regularised Fisher) if you need
-a finite bound on every knot.
+What the anchor costs, precisely.  ``H_gauge = 1·1ᵀ/(gauge_sd²·K²)`` lives entirely
+in the gauge direction ``v = (1_K, 0…0)/√K``, while ``F_N`` lives entirely in
+``v^⊥``.  They block-diagonalise against the same split, so
+
+    cov = pinv(F_N) + gauge_sd²·K·v vᵀ
+
+exactly.  ``v`` is zero on ``logD`` and on all four rates, so **σ_D and σ_rates are
+untouched**, and so is every gauge-blind landscape functional (any ``d`` with
+``dᵀ1 = 0``, e.g. a barrier height ``U(x_bar) − U(x_well)``).  What does move is the
+per-knot σ: each knot's variance is larger by exactly ``gauge_sd²`` than it would be
+in the strict sum-to-zero gauge.  ``cov`` is reported raw (no projection), so a
+per-knot σ is a σ *in the weakly-anchored mean(theta) gauge* — which is the honest
+Laplace posterior, but means a per-knot number is only interpretable together with
+``gauge_sd``.  (``recovered_potential`` reports the grid-mean-zero gauge; it differs
+by a constant only, so the landscape *shape* is unaffected.)
+
+Identifiability: the anchor pins exactly ONE direction, the gauge.  Knots outside the
+FRET-observable window are separately near-unconstrained by the data, and the anchor
+does nothing for them — ``F_N + H_gauge`` can still be singular, in which case the
+Cholesky refuses, the floored SVD takes over and ``null_dim`` reports how many
+directions had to be floored (``0`` = an exact inverse, the normal case).  A σ in a
+floored direction is a *lower bound*; inspect the Fisher diagonal to see which knots
+are informed, and add a landscape prior if you need a finite bound on every knot.
 
 Caveats:
   * The bound is evaluated at the supplied ground-truth ``φ`` in the estimator's
@@ -56,6 +70,7 @@ Caveats:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -63,8 +78,8 @@ import torch
 
 from .config import DTYPE, PriorConfig
 from .forward import build_propagator_from_u, marginal_loglik_batch
-from .generator import stationary
-from .objective import prior_penalty, gauge_penalty_from_offset
+from .generator import stationary, min_gauge
+from .objective import prior_penalty, gauge_penalty_from_offset, gauge_offset_from_theta
 from .photophysics import EffectiveRates
 
 _RATE_NAMES = ("a_g", "a_r", "bg_g", "bg_r")
@@ -76,27 +91,40 @@ class CRBResult:
     """Cramér–Rao bound for one dataset at the ground-truth parameters.
 
     ``fisher``           : [P,P] total Fisher information ``F_N`` for the dataset.
+                           The pure likelihood information — never includes the anchor
+                           or the prior, so the gauge stays an exact null direction here.
     ``fisher_per_trace`` : [P,P] ``F_N / N`` (Fisher is additive over traces).
-    ``cov``              : [P,P] the CRB = gauge-fixed ``inv(F_N)`` (pseudo-inverse
-                           on the informative subspace; landscape in sum-to-zero gauge).
+    ``cov``              : [P,P] ``inv(posterior_precision)`` — the bound WITH the gauge
+                           anchor always included, reported raw (no gauge projection).
+                           Landscape σ are therefore in the weakly-anchored
+                           ``mean(theta)`` gauge: each knot's variance exceeds the strict
+                           sum-to-zero value by exactly ``gauge_sd²``.  σ_D, σ_rates and
+                           every gauge-blind functional are unaffected — see the module
+                           docstring for the exact decomposition.
     ``sigma``            : [P] ``sqrt(diag(cov))`` in the inference parameterisation
                            (kT knots, lnD, ln-rates).
     ``param_names``      : [P] names, ``["knot_0",…,"logD","log_a_g",…]``.
     ``sigma_physical``   : dict of σ in physical units — ``knots`` (kT, per knot),
                            ``D`` (nm²/ms), ``a_g/a_r/bg_g/bg_r`` (kHz), via the delta method.
     ``n_traces``, ``n_photons`` : dataset size.
-    ``null_dim``         : # of dropped/floored null directions.  Without a prior:
-                           1 = the landscape gauge only.  With a prior: 0 for a
-                           healthy proper posterior (any count > 0 flags a direction
-                           the prior failed to pin numerically).
+    ``null_dim``         : # of floored directions.  ``0`` (the normal case) means the
+                           information matrix was positive definite and inverted EXACTLY
+                           by Cholesky, with no threshold involved.  ``> 0`` means it was
+                           genuinely singular and that many directions had to be floored
+                           — a real unidentifiability (typically knots the data never
+                           see), not a numerical cutoff.  The gauge itself no longer
+                           shows up here: the anchor pins it.
     ``info_matrix_rel_frob`` : if ``validate=True``, ‖Cov(score) − (−E[H])‖ / ‖E[H]‖
                            (information-matrix identity check); else ``None``.
-    ``posterior_precision`` : if a ``prior`` was passed, the posterior information
-                           ``F_N + H_prior`` (the analytic Laplace precision); ``cov``
-                           is then its inverse (the posterior covariance) rather than
-                           the pure-likelihood CRB.  ``None`` for the prior-free CRB.
-    ``prior_included``   : whether ``cov``/``sigma`` include the prior (posterior)
-                           or are the pure-likelihood Cramér–Rao bound.
+    ``posterior_precision`` : the matrix that was actually inverted to get ``cov`` —
+                           ``F_N`` plus the gauge anchor's Hessian, plus the prior's and
+                           the rate prior's if a ``prior`` was passed (the analytic
+                           Laplace precision).  ``None`` only in the fully unpenalised
+                           case (``prior=None`` AND ``gauge_sd=None``), where ``cov``
+                           falls back to the bare pseudo-inverse of ``F_N``.
+    ``prior_included``   : whether a ``PriorConfig`` contributed to ``cov``/``sigma``.
+                           The gauge anchor is not a prior in this sense and is not
+                           reflected here — it is on unless ``gauge_sd=None``.
     """
 
     fisher: torch.Tensor
@@ -204,7 +232,7 @@ def _single_logL(phi, ipt, colors, mask, B, b0, grid, C, R0, dx, jitter, pdt, p0
     K = B.shape[1]
     theta, D, rates = _unpack_phi(phi, K)
     u = B @ theta + b0
-    u = u - u.min()                                       # gauge-fix (as forward does)
+    u = min_gauge(u)                          # exp(-u) overflow guard (as forward does)
     prop = build_propagator_from_u(u, D, rates, grid, C, R0, dx, jitter)
     p0v = stationary(u) if p0 is None else p0
     return _mp_recursion(prop, ipt, colors, mask, p0v, pdt)
@@ -294,6 +322,33 @@ def _svd_inverse(M, rtol, *, floor):
     return 0.5 * (cov + cov.T), int(small.sum())
 
 
+def _psd_inverse(M, rtol):
+    """Inverse of a symmetric POSITIVE DEFINITE ``M``, returning ``(cov, n_floored)``.
+
+    Tries a Cholesky factorisation first.  If it succeeds, ``M`` is positive definite,
+    the inverse is exact (no threshold anywhere) and ``n_floored`` is ``0``.  If it
+    fails, ``M`` really is singular and we fall back to ``_svd_inverse(..., floor=True)``,
+    which reports how many directions it had to floor.
+
+    Why not just use ``_svd_inverse`` everywhere: its cutoff is RELATIVE, ``rtol·σ_max``,
+    so it silently assumes ``cond(M) < 1/rtol``.  A posterior precision breaks that
+    assumption as soon as the data are good -- ``σ_max`` tracks the photon count while
+    ``σ_min`` sits at the prior scale -- and when it does, flooring clamps a precision UP,
+    hence a variance DOWN.  The error is therefore ONE-SIDED: it can only ever make a
+    reported σ too small, i.e. over-confident, and nothing in the returned values says so
+    beyond ``n_floored``.  Cholesky removes the assumption: it either inverts exactly or
+    refuses, and the factorisation succeeding is itself the proof that every direction is
+    pinned (by prior, gauge anchor and data together -- the prior alone does not do it).
+    """
+    M = 0.5 * (M + M.T)
+    try:
+        L = torch.linalg.cholesky(M)
+    except Exception:                                     # not PD -> genuinely singular
+        return _svd_inverse(M, rtol, floor=True)
+    cov = torch.cholesky_inverse(L)
+    return 0.5 * (cov + cov.T), 0
+
+
 # --------------------------------------------------------------------------- #
 # Prior Hessian  (turns the Fisher into the posterior information matrix)
 # --------------------------------------------------------------------------- #
@@ -309,35 +364,49 @@ class _PriorModule(torch.nn.Module):
         return prior_penalty(self.potential, D, grid, prior)
 
 
-def _prior_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
-    """``d²(-log prior)/dφ²`` at ``phi_star`` — the prior's contribution to the
-    posterior information matrix.
+def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
+    """``d²(-log penalty)/dφ²`` at ``phi_star`` — everything added to the Fisher.
 
-    Matches the target ``sample.build_log_prob`` (hence HMC / Laplace-IS) uses: the
-    ``PriorConfig`` prior (curvature / GP / l2, via ``objective.prior_penalty``) plus
-    a Gaussian gauge anchor (``gauge_sd``, pins the otherwise-flat ``mean(theta)``
-    direction) and a Gaussian rate prior (``rate_sd``).  Every term is quadratic in
-    ``φ`` so the Hessian is constant; it is taken by autograd double-backward for
-    generality (the same machinery ``_mean_hessian`` uses).  ``gauge_sd``/``rate_sd``
-    may be ``None`` to omit that term.
+    Two independently gated groups, and the distinction is the point:
+
+    * the **gauge anchor** (``gauge_sd``) is a choice of coordinates, so it is included
+      whenever ``gauge_sd is not None`` — *regardless of* ``prior``.  It is what makes
+      the information matrix invertible at all.
+    * the **``PriorConfig`` prior** (curvature / GP / l2, via ``objective.prior_penalty``)
+      and the **Gaussian rate prior** (``rate_sd``) are beliefs about physics, so they
+      opt in together with ``prior``; ``rate_sd`` is ignored when ``prior is None``.
+
+    With a ``prior`` this reproduces the target ``sample.build_log_prob`` uses (hence
+    HMC) exactly.  Every term is quadratic in ``φ`` so the Hessian is
+    constant; it is taken by autograd double-backward for generality (the same
+    machinery ``_mean_hessian`` uses).
+
+    Returns ``None`` if nothing at all is penalised (``prior is None`` and
+    ``gauge_sd is None``), which the caller reads as "invert the bare Fisher".
     """
+    if prior is None and gauge_sd is None:
+        return None
+
     from torch.func import functional_call
     module = _PriorModule(potential)
     log_rates0 = phi_star[K + 1:K + 5].detach()
 
-    def neg_log_prior(phi):
+    def neg_log_penalty(phi):
         theta = phi[:K]
-        D = torch.exp(phi[K])
-        log_rates = phi[K + 1:K + 5]
-        out = functional_call(module, {"potential.theta": theta},
-                              args=(D, grid, prior))
+        out = torch.zeros((), dtype=phi.dtype, device=phi.device)
+        if prior is not None:
+            D = torch.exp(phi[K])
+            out = out + functional_call(module, {"potential.theta": theta},
+                                        args=(D, grid, prior))
+            if rate_sd is not None:
+                log_rates = phi[K + 1:K + 5]
+                out = out + 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()
         if gauge_sd is not None:
-            out = out + gauge_penalty_from_offset(theta.mean(), gauge_sd)
-        if rate_sd is not None:
-            out = out + 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()
+            out = out + gauge_penalty_from_offset(
+                gauge_offset_from_theta(theta), gauge_sd)
         return out
 
-    H = torch.autograd.functional.hessian(neg_log_prior, phi_star.detach())
+    H = torch.autograd.functional.hessian(neg_log_penalty, phi_star.detach())
     return 0.5 * (H + H.T)
 
 
@@ -365,20 +434,23 @@ def cramer_rao_bound(
 ) -> CRBResult:
     """Cramér–Rao bound on ``[landscape knots | D | photophysics rates]``.
 
-    With ``prior=None`` (default) this is the pure-likelihood CRB: ``cov = pinv(F_N)``
-    with the exactly-unidentified landscape gauge (and any data-unconstrained knots)
-    dropped by the pseudo-inverse.
+    The Gaussian gauge anchor (``gauge_sd``, the same one ``infer.fit`` and the sampler
+    apply) is **always** included, whether or not a ``prior`` is given: the landscape
+    offset is an exact flat direction, so without the anchor there is nothing to invert
+    but a singular matrix.  With it, ``F_N + H_gauge`` is normally positive definite and
+    is inverted exactly by Cholesky.  ``cov`` is reported raw, so per-knot σ carry the
+    anchor's ``gauge_sd²`` of extra variance while σ_D, σ_rates and all gauge-blind
+    landscape functionals are untouched — the module docstring gives the exact identity.
 
-    With a ``prior`` (a ``PriorConfig`` with ``gp_sigma`` set, as for the sampler) the
-    prior's Hessian is added to the Fisher, giving the **posterior information matrix**
-    ``F_N + H_prior`` — i.e. the analytic Laplace precision the ``sample`` / ``laplace_is``
-    modules expand around.  ``cov``/``sigma`` are then the **posterior** covariance/σ
-    (the prior regularises the soft edge-knot and gauge directions, so the result is
-    proper and finite on every parameter — no dropped directions).  The added prior
-    terms match ``sample.build_log_prob`` exactly: the ``PriorConfig`` prior plus a
-    Gaussian gauge anchor (``gauge_sd``) and Gaussian rate prior (``rate_sd``); set
-    either to ``None`` to omit it.  Evaluate at a MAP (``dfl.fit`` output) for the
-    Laplace interpretation; at the truth it is the posterior information at truth.
+    With ``prior=None`` (default) this is therefore the likelihood CRB in the anchored
+    gauge.  With a ``prior`` (a ``PriorConfig`` with ``gp_sigma`` set, as for the sampler)
+    the prior's Hessian and the Gaussian rate prior are added as well, giving the
+    **posterior information matrix** — the analytic Laplace precision the ``sample``
+    module expands around, matching ``sample.build_log_prob`` exactly.
+    ``cov``/``sigma`` are then the posterior covariance/σ, with the prior additionally
+    regularising the soft edge-knot directions the anchor cannot reach.  Evaluate at a
+    MAP (``dfl.fit`` output) for the Laplace interpretation; at the truth it is the
+    posterior information at truth.
 
     Parameters
     ----------
@@ -397,12 +469,18 @@ def cramer_rao_bound(
         Fixed crosstalk / Förster radius (as in ``fit`` / ``marginal_loglik_batch``).
     prior : PriorConfig | None
         If given, include the prior's Hessian so ``cov`` is the posterior covariance
-        (Laplace precision ``F_N + H_prior``) rather than the pure CRB.  Needs a
-        proper landscape prior (``gp_sigma`` set) for a finite result on the gauge.
-    gauge_sd, rate_sd : float | None
-        Std of the Gaussian gauge anchor / rate prior added alongside ``prior``
-        (match the values used in the fit / sampler).  ``None`` omits the term.
-        Ignored when ``prior is None``.
+        (Laplace precision) rather than the likelihood CRB.  A proper landscape prior
+        (``gp_sigma`` set) is what gives a finite bound on knots the data never see;
+        the gauge itself is handled by ``gauge_sd`` independently of this.
+    gauge_sd : float | None
+        Std of the Gaussian gauge anchor on ``mean(theta)``, added ALWAYS — not gated on
+        ``prior``.  Match the value used in the fit / sampler (both default to ``1.0``).
+        ``None`` omits it and falls back to the pseudo-inverse of the bare Fisher, which
+        warns: per-knot σ then become lower bounds in a thresholded null space, and
+        ``null_dim`` changes meaning.  Only pass ``None`` deliberately.
+    rate_sd : float | None
+        Std of the Gaussian rate prior.  A belief about photophysics, so unlike
+        ``gauge_sd`` it opts in with the rest of the prior: ignored when ``prior is None``.
     validate : bool
         Also compute the observed information ``E[-H]`` and report the
         information-matrix-identity relative-Frobenius agreement (diagnostic).
@@ -411,10 +489,23 @@ def cramer_rao_bound(
     -------
     CRBResult
         Fisher / per-trace Fisher / covariance matrices, per-parameter σ (inference
-        params and physical units), parameter names, and dataset sizes.  When ``prior``
-        is given, ``posterior_precision`` holds ``F_N + H_prior`` and
-        ``prior_included`` is ``True``.
+        params and physical units), parameter names, and dataset sizes.
+        ``posterior_precision`` holds the matrix that was inverted (``F_N`` plus the
+        anchor, plus the prior if given); ``prior_included`` reports whether a
+        ``PriorConfig`` contributed.
     """
+    if gauge_sd is None:
+        warnings.warn(
+            "cramer_rao_bound(gauge_sd=None): the landscape offset is an exact flat "
+            "direction, so without the gauge anchor the matrix being inverted is "
+            "singular and `cov` becomes a THRESHOLDED pseudo-inverse. Consequences for "
+            "anything downstream: per-knot sigma are lower bounds rather than bounds, "
+            "`null_dim` counts the gauge instead of real unidentifiability, and the "
+            "result depends on `gauge_rtol`. Pass a gauge_sd (the fit and sampler both "
+            "use 1.0) unless you specifically want the textbook unanchored CRB.",
+            RuntimeWarning, stacklevel=2,
+        )
+
     device = grid.device
     B, b0 = _knot_basis(potential, grid)
     B = B.to(device=device, dtype=DTYPE)
@@ -447,12 +538,16 @@ def cramer_rao_bound(
     fisher = 0.5 * (fisher + fisher.T)
     fisher_per_trace = fisher / N
 
-    if prior is not None:
-        # posterior information = Fisher + prior Hessian (the Laplace precision).
-        Hprior = _prior_hessian(phi, potential, grid, prior, K, gauge_sd, rate_sd)
-        posterior_precision = 0.5 * ((fisher + Hprior) + (fisher + Hprior).T)
-        cov, null_dim = _svd_inverse(posterior_precision, gauge_rtol, floor=True)
+    H = _penalty_hessian(phi, potential, grid, prior, K, gauge_sd, rate_sd)
+    if H is not None:
+        # information = Fisher + gauge anchor (always) + prior Hessian (if any).
+        # Normally positive definite, so invert it EXACTLY; `_psd_inverse` falls back to
+        # the floored SVD only if it genuinely is not (unseen knots, not the gauge).
+        posterior_precision = 0.5 * ((fisher + H) + (fisher + H).T)
+        cov, null_dim = _psd_inverse(posterior_precision, gauge_rtol)
     else:
+        # gauge_sd=None and no prior: nothing pins the gauge, so it is an EXACT null
+        # direction of what we invert -> drop it (pseudo-inverse).  Warned about above.
         posterior_precision = None
         cov, null_dim = _svd_inverse(fisher, gauge_rtol, floor=False)
     sigma = torch.sqrt(torch.diag(cov).clamp_min(0.0))

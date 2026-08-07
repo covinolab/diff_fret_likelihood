@@ -35,7 +35,7 @@ import warnings
 import torch
 
 from .config import DTYPE
-from .generator import smoluchowski, symmetrize, stationary
+from .generator import smoluchowski, symmetrize, stationary, min_gauge
 from .photophysics import EffectiveRates, emission_rates
 
 # warn only ONCE per fallback kind (this runs inside the HMC hot loop; a bare
@@ -170,9 +170,8 @@ def build_propagator_from_u(
 
 
 def _BasePotential_on_grid(potential, grid):
-    """Gauge-fixed potential on the grid (min subtracted)."""
-    u = potential.on_grid(grid)
-    return u - u.min()
+    """Potential on the grid with the ``exp(-u)`` overflow guard applied."""
+    return min_gauge(potential.on_grid(grid))
 
 
 # ---------------------------------------------------------------------------

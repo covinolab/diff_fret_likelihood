@@ -81,7 +81,7 @@ C_gr, C_rg = 0.10, 0.05                                         # crosstalk
 # --- simulate photon streams (CPU-only Cython simulator; run before any CUDA) ---
 batch = dfl.simulate.simulate_equilibrium(
     x_knots, y_knots, D_true, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg,
-    T=150.0, dt=5e-6, N_max=30_000, n_traces=64, seed=0,
+    T=150.0, dt=5e-6, n_traces=64, seed=0,
 )                                                               # -> dfl.simulate.Batch
 
 # --- fit (grid = FRET-observable band, not the wide simulation domain) ---
@@ -160,10 +160,67 @@ print(crb.sigma_physical["D"])        # σ_D lower bound (nm^2/ms)
 print(crb.sigma_physical["knots"])    # per-knot σ (kT)
 ```
 
-Pass a proper `prior` (with `gp_sigma`) to get the **posterior** covariance
-(`F_N + H_prior`, the analytic Laplace precision) instead of the pure-likelihood
-bound. Evaluate at a `fit` MAP for the Laplace interpretation, or at the truth for
-the bound at truth.
+The Gaussian **gauge anchor** (`gauge_sd`, default `1.0`, the same one `fit` uses) is
+always included — the landscape offset is an exact flat direction, so without it the
+information matrix is singular and only an SVD threshold stands between you and a
+meaningless number. With it, `F_N + H_gauge` is inverted exactly by Cholesky. The cost
+is confined to the per-knot σ, which carry `gauge_sd²` of extra variance:
+`cov = pinv(F_N) + gauge_sd²·K·v vᵀ` exactly, with `v` the unit constant-knot
+direction. Since `v` is zero on `logD` and the rates, **σ_D, σ_rates and every
+gauge-blind functional** (barrier heights, CRB bands) are unaffected. `gauge_sd=None`
+restores the unanchored pseudo-inverse and warns.
+
+Pass a proper `prior` (with `gp_sigma`) to also add the prior's Hessian, giving the
+**posterior** covariance (the analytic Laplace precision) rather than the likelihood
+bound; that is what pins knots the data never see, which the anchor alone cannot do.
+Evaluate at a `fit` MAP for the Laplace interpretation, or at the truth for the bound
+at truth.
+
+## Reconstructing the hidden trajectory
+
+Running the filter once forward and once backward answers "what did the molecule
+actually do?". With the backward filter `β(x,t)` (the adjoint of the tilted
+generator, `β(·,T) = 1`, `β(·,t_k⁻) = μ_{c_k} β(·,t_k⁺)`), the likelihood can be
+evaluated by stopping anywhere,
+
+```
+log L = log ⟨β(·,t), ρ(·,t)⟩     for any t ∈ [0, T],
+```
+
+and the posterior over the latent coordinate given *all* the data — the smoothing
+distribution — is `γ(x,t) = β(x,t) ρ(x,t) / L`:
+
+```python
+res = dfl.reconstruct_trace(
+    times, colors, T, res_fit.potential, res_fit.D, res_fit.rates,
+    grid, consts.crosstalk_tensor(), consts.R0,
+    t_out=torch.arange(0.0, T, 0.1),   # None -> report at the photon times
+    n_paths=5,                         # exact posterior sample trajectories
+)
+res.x_mean, res.x_sd     # [M] reconstruction with error bands (nm)
+res.paths                # [5, M] sampled trajectories, dynamically admissible
+res.loglik, res.loglik_spread   # log L via ⟨β,ρ⟩ and its constancy over t
+```
+
+`loglik_spread` is a sharp self-test on the whole evaluator: `⟨β,ρ⟩` must be the
+same at every `t` and equal `marginal_loglik` (~1e-12 in practice).
+
+`gamma` is the full answer; the rest is one line from it — in particular
+
+```python
+E_mean = res.gamma @ dfl.fret_efficiency(res.grid, consts.R0)
+```
+
+is the model's posterior FRET efficiency, the calibrated counterpart of a binned
+"apparent E(t)" trace. Note `E_mean ≠ E(x_mean)`. The pointwise mode is
+`res.grid[res.gamma.argmax(-1)]`, which differs from `x_mean` exactly when `γ` is
+bimodal — for a hopping molecule the *mean* sits on the barrier top, where the
+molecule essentially never is; sampled `paths` are the honest single-trajectory view.
+
+Cost is ~2× one likelihood evaluation (plus one pass per sampled path), it runs
+under `no_grad` in float64, and the reconstruction near either end of the window is
+prior-dominated over roughly one relaxation time. `reconstruct_batch` loops over the
+traces of a `Batch`.
 
 ## Bring your own data
 
@@ -193,11 +250,15 @@ Build one from your own `(times, colors)` arrays by sorting each trace, taking
   for HMC.** Use it as the single shape prior (`curvature_weight=0`).
 * `logD_mean` / `logD_std` — weak Gaussian prior on `log D`.
 * `l2_weight` — weak L2 on the potential parameters.
-* `max_entropy_weight` — max-entropy landscape penalty.
 
 Inspect active terms with `prior.active_terms()` / `prior.describe()`. Pass
 `prior=None` to `fit` for a pure MLE (or `PriorConfig.none()` where an instance is
 required); HMC requires a proper prior and raises on `None`.
+
+The **gauge anchor** is deliberately *not* one of these terms. It pins the offset of
+`U` (a coordinate choice, not a belief), so it is applied unconditionally by `fit`,
+`fit_multi`, the sampler and `cramer_rao_bound` — independently of `prior` — and is
+tuned by the separate `gauge_sd` argument.
 
 ## Potentials
 
@@ -229,12 +290,12 @@ steep landscapes; gradients still flow.
 | `photophysics.py` | `E(x)`, crosstalk mixing, emission rates `μ_G, μ_R`, `EffectiveRates` |
 | `generator.py` | detailed-balance Smoluchowski `L`; symmetrisation; validity checks |
 | `forward.py` | marginal log-likelihood (eigendecomp propagator, single + batched); robust `eigh`; compile / fp32 paths |
-| `objective.py` | `neg_log_posterior` (marginal + priors); curvature / GP / max-entropy priors |
+| `objective.py` | `neg_log_posterior` (marginal + priors); curvature / GP / `logD` / L2 priors; the gauge anchor |
 | `infer.py` | `fit` (Adam + graduated non-convexity MAP); `recovered_potential` |
 | `fisher.py` | `cramer_rao_bound`: Fisher information and CRB (pure or posterior) |
+| `reconstruct.py` | backward filter `β`; smoothing posterior over `x(t)` with error bands; exact posterior sample paths |
 | `sample.py` | HMC/NUTS posterior sampling of `U(x)`, `D`, rates (single / multi-chain) |
-| `laplace_is.py` | Laplace-proposal importance-sampling posterior from a MAP |
-| `init.py` | data-driven warm-starts: histogram landscape `u ≈ -log π̂`, `D` from autocorrelation |
+| `init.py` | `warmstart_potential` (fit a potential to a target profile); rough initial `EffectiveRates` |
 | `simulate.py` | Cython simulator wrapper; parallel equilibrium trace generation → `Batch` |
 | `utils.py` | seeding, positivity transforms, log-space helpers |
 

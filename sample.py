@@ -44,7 +44,8 @@ import torch
 from torch.func import functional_call
 
 from .config import DTYPE, PriorConfig
-from .objective import neg_log_posterior, gauge_penalty_from_offset
+from .objective import (neg_log_posterior, gauge_penalty_from_offset,
+                        gauge_offset_from_theta)
 from .photophysics import EffectiveRates
 
 N_RATES = 4  # a_g, a_r, bg_g, bg_r
@@ -160,11 +161,13 @@ def build_log_prob(
                   compile_mode, propagate_dtype),
         )
         rate_prior = 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()
-        # Same pure-gauge anchor infer.fit uses (objective.gauge_penalty). Must read
-        # flat_pot.mean() from the swapped z-slice here, not potential.theta (the
-        # module's params are only substituted inside functional_call above).
-        gauge = gauge_penalty_from_offset(flat_pot.mean(), gauge_sd) if is_spline \
-            else torch.zeros((), dtype=z.dtype, device=z.device)
+        # Same pure-gauge anchor infer.fit and fisher use (objective.gauge_offset_from_
+        # theta). Must read the offset off the swapped z-slice here, not potential.theta
+        # (the module's params are only substituted inside functional_call above).
+        # Dropped for the MLP: there `flat_pot` is raw net weights, whose mean is not the
+        # gauge coordinate at all (see objective.gauge_offset on that asymmetry).
+        gauge = gauge_penalty_from_offset(gauge_offset_from_theta(flat_pot), gauge_sd) \
+            if is_spline else torch.zeros((), dtype=z.dtype, device=z.device)
         return -(nlp + rate_prior + gauge)
 
     z0 = _flatten_init(potential, D_init, rates_init)
