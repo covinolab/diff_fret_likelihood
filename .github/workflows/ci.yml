@@ -31,8 +31,33 @@ jobs:
       - name: Install PyTorch (CPU)
         run: pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
 
+      # Non-editable, so this doubles as the packaging smoke test: it proves the
+      # wheel builds and that `pip install diff_fret_likelihood` works for a user.
       - name: Install package (with dev extras)
         run: pip install ".[dev]"
 
-      - name: Run tests
-        run: python -m pytest tests -q
+      # The install above puts the compiled extensions in site-packages, but
+      # tests/conftest.py prepends the SOURCE TREE to sys.path (so edits are what gets
+      # tested) and *.so is gitignored -- so the tree must carry them too. Without this
+      # `diff_fret_likelihood.simulator` is missing from the copy pytest imports and
+      # every simulator test skips (or errors) while CI stays green.
+      # setuptools/Cython are named explicitly: the install above resolved them inside
+      # pip's isolated build env, so they are absent from the runtime env.
+      - name: Build the Cython extensions in place
+        run: |
+          pip install "setuptools>=64" "Cython>=3.0"
+          python build_cython.py
+
+      # Mirrors conftest's sys.path insert, so it checks the copy pytest will import.
+      # Turns a build regression into a loud failure instead of 13 silent skips.
+      - name: Verify the in-place extensions import
+        run: |
+          python -c "import sys; sys.path.insert(0, '..'); \
+            import diff_fret_likelihood.simulator as s, diff_fret_likelihood.doob_tpt as d; \
+            print(s.__file__); print(d.__file__)"
+
+      # `slow` = test_bartlett_fisher, whose 300 traces are ~10 min of simulation on a
+      # 2-core runner with an always-cold cache. Run it locally:
+      #   pytest tests/test_bartlett_fisher.py -s
+      - name: Run tests (excluding the slow statistical tests)
+        run: python -m pytest tests -q -m "not slow"

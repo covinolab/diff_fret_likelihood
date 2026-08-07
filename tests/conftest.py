@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 import torch
 
-# make `import diff_fret_likelihood` work when running pytest from anywhere
+# make `import diff_fret_likelihood` work when running pytest from anywhere.
+# NOTE: insert(0, ...) means the SOURCE TREE WINS over any installed copy -- edits are
+# what gets tested. Consequence: the tree must also carry the compiled extensions
+# (`*.so`, gitignored), or `diff_fret_likelihood.simulator` is missing here even when
+# `pip install .` built it into site-packages, and every simulator test skips. CI
+# therefore runs `python build_cython.py` after installing (see .github/workflows/ci.yml).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 torch.set_default_dtype(torch.float64)

@@ -17,6 +17,24 @@ The anchor's exact price is pinned too: `cov = pinv(F_N) + gauge_sd^2 * K * v v^
 with `v` the unit constant-knot direction, so only per-knot sigma move and sigma_D /
 sigma_rates / gauge-blind functionals are untouched.
 
+Why the anchor is always on, and never gated on the prior -- the part these tests
+assume rather than re-derive:
+
+  * `v` is an EXACT null direction of `F_N` (tested below), so without the anchor the
+    posterior precision is singular and has no inverse to report;
+  * a landscape prior cannot stand in for it.  The mean-centred GP prior is itself
+    gauge-invariant, and the curvature prior `D2^T D2` has a 2-dim null space
+    {constant, linear} -- both are structurally blind to the gauge;
+  * conversely the anchor pins exactly ONE direction.  Data that leave other knot
+    directions weakly constrained still need a landscape prior for a finite per-knot
+    sigma; the anchor does not rescue them.
+
+**Everything here runs anchored.**  `gauge_sd=None` is deliberately not exercised: it
+hands the inverter a matrix that is singular to working precision, so which way the
+inverter resolves it is decided by the sign of a ~1e-17 rounding error -- which differs
+between machines (it differed between a workstation and CI).  There is no stable answer
+to assert, and `cramer_rao_bound` warns against the configuration anyway.
+
 Statistical correctness at the truth (information-matrix identity `Cov(s)=-E[H]`
 and the `1/sqrt(N)` law) is exercised separately with real simulated traces in
 the end-to-end verification script.
@@ -66,17 +84,25 @@ def _crb(s, **kw):
                                 s["rates"], s["C"], s["R0"], **kw)
 
 
-def _unanchored(s, **kw):
-    """The pre-anchor pseudo-inverse CRB, which now warns (that is the point)."""
-    with pytest.warns(RuntimeWarning, match="gauge_sd=None"):
-        return _crb(s, gauge_sd=None, **kw)
-
-
 def _gauge_dir(K, P, dtype=torch.float64):
     """The unit constant-knot direction ``v`` -- the exact flat direction of U."""
     v = torch.zeros(P, dtype=dtype)
     v[:K] = 1.0 / np.sqrt(K)
     return v
+
+
+def _anchor_hessian(K, P, gauge_sd, dtype=torch.float64):
+    """The anchor's own Hessian: ``1 1^T / (gauge_sd^2 K^2)`` on the landscape block.
+
+    Rank one, acting as ``1/(gauge_sd^2 K)`` along ``v`` and as exactly zero on every
+    direction orthogonal to it -- the form asserted in
+    ``test_prior_free_default_still_reports_no_prior_but_is_anchored``.  Subtracting it
+    from ``posterior_precision`` recovers the un-anchored precision without running the
+    CRB in a configuration that has no stable answer (see the module docstring).
+    """
+    H = torch.zeros(P, P, dtype=dtype)
+    H[:K, :K] = 1.0 / (gauge_sd ** 2 * K ** 2)
+    return H
 
 
 def test_returns_expected_shapes_and_names(crb_setup):
@@ -118,17 +144,6 @@ def test_landscape_constant_shift_is_a_gauge_null_direction(crb_setup):
     assert float((res.fisher @ n).norm()) < 1e-7 * emax          # exact null direction
 
 
-def test_without_the_anchor_the_gauge_is_dropped_from_cov(crb_setup):
-    # The old default: nothing pins the gauge, so the pseudo-inverse drops it and
-    # reports it in null_dim.  Reachable only by asking for it, and it warns.
-    s = crb_setup
-    res = _unanchored(s)
-    n = _gauge_dir(s["K"], s["K"] + 5, res.cov.dtype)
-    assert res.null_dim >= 1                                     # dropped by the pinv
-    assert res.posterior_precision is None                       # nothing was added
-    assert float((res.cov @ n).norm()) < 1e-6 * float(res.cov.abs().max())
-
-
 @pytest.mark.parametrize("gauge_sd", [1.0, 0.25])
 def test_anchor_gives_the_gauge_exactly_its_prior_variance(crb_setup, gauge_sd):
     """``v @ cov @ v == gauge_sd^2 * K``, exactly and unconditionally.
@@ -145,61 +160,48 @@ def test_anchor_gives_the_gauge_exactly_its_prior_variance(crb_setup, gauge_sd):
     assert float(v @ res.cov @ v) == pytest.approx(s["K"] * gauge_sd ** 2, rel=1e-8)
 
 
-def test_anchor_touches_nothing_but_the_gauge_direction(crb_setup):
-    """The anchor's whole effect is the rank-one term along ``v``.
+@pytest.mark.parametrize("gauge_sd", [1.0, 0.25])
+def test_anchor_touches_nothing_but_the_gauge_direction(crb_setup, gauge_sd):
+    """The anchor's whole effect is its rank-one term along ``v``:
 
-    Uses the posterior (GP-prior) CRB, because there the gauge is the ONLY null
-    direction -- the precondition for comparing against an unanchored run at all.  On
-    the prior-free path the data leave other knot directions unconstrained too, and the
-    two inverses then legitimately disagree about those (see the next test).
+        ``cov == pinv(F_N + H_prior) + gauge_sd**2 * K * v v^T``
 
-    Since the mean-centred GP prior is itself gauge-invariant, it does not pin the gauge:
-    only the anchor does.  That is exactly why the anchor is not gated on the prior.
+    From a SINGLE anchored run.  The un-anchored precision ``A`` is recovered by
+    subtracting the anchor's own Hessian, and the pseudo-inverse is taken *here* rather
+    than asked of the CRB -- an actual ``gauge_sd=None`` call would hand the inverter a
+    matrix that is singular to working precision, whose resolution is decided by a
+    ~1e-17 rounding sign (see the module docstring).  Nothing below depends on which
+    inverse branch ran.
+
+    Uses the posterior (GP-prior) CRB so that the gauge is the only null direction of
+    ``A``.  The GP prior is mean-centred, hence gauge-invariant, so it does not pin the
+    gauge itself -- asserted below, and the reason the anchor is not gated on the prior.
     """
     s = crb_setup
     K, P = s["K"], s["K"] + 5
-    anchored, plain = _post(s), _post(s, gauge_sd=None, _warn=True)
-    v = _gauge_dir(K, P, anchored.cov.dtype)
-    proj = torch.eye(P, dtype=anchored.cov.dtype) - torch.outer(v, v)
+    r = _post(s, gauge_sd=gauge_sd)
+    v = _gauge_dir(K, P, r.cov.dtype)
 
-    # off the gauge direction the two covariances agree to machine precision
-    pa, pu = proj @ anchored.cov @ proj, proj @ plain.cov @ proj
-    assert float((pa - pu).abs().max()) < 1e-10 * float(pa.abs().max())
+    A = r.posterior_precision - _anchor_hessian(K, P, gauge_sd, r.cov.dtype)
+    A = 0.5 * (A + A.T)                                  # == F_N + H_prior
+    # the prior left the gauge exactly as unpinned as the likelihood did
+    assert abs(float(v @ A @ v)) < 1e-12 * float(torch.linalg.eigvalsh(A).max())
+    pinvA = torch.linalg.pinv(A, rtol=1e-10)
 
-    # hence every quantity that lives off it is untouched: D, the rates, and any
-    # gauge-blind landscape functional (a "barrier height" d, with d . 1 = 0)
-    assert anchored.sigma_physical["D"] == pytest.approx(
-        plain.sigma_physical["D"], rel=1e-10)
-    for nm in ("a_g", "a_r", "bg_g", "bg_r"):
-        assert anchored.sigma_physical[nm] == pytest.approx(
-            plain.sigma_physical[nm], rel=1e-10)
-    d = torch.zeros(P, dtype=anchored.cov.dtype)
+    assert float((r.cov - (pinvA + gauge_sd ** 2 * K * torch.outer(v, v))).abs().max()) \
+        < 1e-9 * float(r.cov.abs().max())
+
+    # hence every quantity that lives off the gauge is untouched: logD, the four log
+    # rates, and any gauge-blind landscape functional (a "barrier height" d, d . 1 = 0)
+    assert torch.allclose(r.sigma[K:], torch.sqrt(torch.diag(pinvA))[K:], rtol=1e-9)
+    d = torch.zeros(P, dtype=r.cov.dtype)
     d[0], d[K - 1] = 1.0, -1.0
-    assert float(d @ anchored.cov @ d) == pytest.approx(
-        float(d @ plain.cov @ d), rel=1e-10)
+    assert float(d @ r.cov @ d) == pytest.approx(float(d @ pinvA @ d), rel=1e-9)
 
-    # and what DOES move: each knot variance carries gauge_sd**2 (= K*gauge_sd**2 times
-    # v_i**2 = 1/K) over its strict sum-to-zero value.  Self-contained, no second run.
-    excess = (torch.diag(anchored.cov)[:K] - torch.diag(pa)[:K]).numpy()
-    assert np.allclose(excess, 1.0, atol=1e-8)
-
-
-def test_anchor_does_not_rescue_non_gauge_unconstrained_directions(crb_setup):
-    """The documented limit: the anchor pins ONE direction, and pinv hides the rest.
-
-    This fixture's random gaps are not model-distributed, so the Fisher is near-null in
-    several knot directions beyond the gauge.  The unanchored pseudo-inverse *drops* them
-    and so reports a sigma that is a lower bound masquerading as a bound; the anchored
-    inverse keeps them and reports the honestly larger value.  A finite bound on every
-    knot needs a landscape prior, not the anchor.
-    """
-    s = crb_setup
-    anchored, plain = _crb(s), _unanchored(s)
-    assert plain.null_dim > 1                        # more than just the gauge is null
-    # the dropped directions carried real variance, so the pinv understated sigma_D
-    assert anchored.sigma_physical["D"] > 2.0 * plain.sigma_physical["D"]
-    # the prior is what fixes this, and then the two agree again (previous test)
-    assert _post(s).sigma_physical["D"] < plain.sigma_physical["D"]
+    # and what DOES move: each knot variance carries exactly gauge_sd**2 (= K*gauge_sd**2
+    # times v_i**2 = 1/K) over its strict sum-to-zero value.
+    excess = (torch.diag(r.cov)[:K] - torch.diag(pinvA)[:K]).numpy()
+    assert np.allclose(excess, gauge_sd ** 2, atol=1e-8)
 
 
 def test_cov_finite_positive_diag(crb_setup):
@@ -235,16 +237,11 @@ def test_fisher_additive_over_traces(crb_setup):
 # --------------------------------------------------------------------------- #
 # prior inclusion: cov becomes the posterior covariance (Fisher + prior Hessian)
 # --------------------------------------------------------------------------- #
-def _post(s, _warn=False, **kw):
-    """The posterior CRB (GP prior).  ``_warn=True`` expects the gauge_sd=None warning."""
+def _post(s, **kw):
+    """The posterior CRB: same call as ``_crb`` plus a mean-centred GP landscape prior."""
     prior = dfl.PriorConfig(curvature_weight=0.0, gp_sigma=2.0, gp_lengthscale=1.0)
-    call = lambda: dfl.cramer_rao_bound(                            # noqa: E731
-        s["batch"], s["grid"], s["pot"], s["D"], s["rates"],
-        s["C"], s["R0"], prior=prior, **kw)
-    if _warn:
-        with pytest.warns(RuntimeWarning, match="gauge_sd=None"):
-            return call()
-    return call()
+    return dfl.cramer_rao_bound(s["batch"], s["grid"], s["pot"], s["D"], s["rates"],
+                                s["C"], s["R0"], prior=prior, **kw)
 
 
 def test_prior_free_default_still_reports_no_prior_but_is_anchored(crb_setup):
@@ -255,13 +252,17 @@ def test_prior_free_default_still_reports_no_prior_but_is_anchored(crb_setup):
     # ... but the anchor DID go in, so there is a matrix that was inverted, and it is
     # the Fisher plus a PSD rank-one term in the gauge direction alone.
     assert res.posterior_precision is not None
+    K, P = crb_setup["K"], crb_setup["K"] + 5
     H = res.posterior_precision - res.fisher
     H = 0.5 * (H + H.T)
     evals = torch.linalg.eigvalsh(H)
     assert float(evals.min()) > -1e-10 * float(evals.max())      # PSD
     assert int((evals > 1e-10 * evals.max()).sum()) == 1          # rank one
-    v = _gauge_dir(crb_setup["K"], crb_setup["K"] + 5, H.dtype)
-    assert float(v @ H @ v) == pytest.approx(1.0 / (crb_setup["K"] * 1.0 ** 2), rel=1e-8)
+    v = _gauge_dir(K, P, H.dtype)
+    assert float(v @ H @ v) == pytest.approx(1.0 / (K * 1.0 ** 2), rel=1e-8)
+    # and it is exactly `1 1^T / (gauge_sd^2 K^2)` on the landscape block -- the form
+    # `test_anchor_touches_nothing_but_the_gauge_direction` subtracts back off
+    assert torch.allclose(H, _anchor_hessian(K, P, 1.0, H.dtype), atol=1e-12)
 
 
 def test_prior_gives_posterior_precision(crb_setup):
@@ -300,11 +301,3 @@ def test_prior_shrinks_vs_the_anchored_crb(crb_setup):
     # and on the landscape block too, where the GP prior actually bites
     for i in range(K):
         assert float(post.sigma[i]) <= float(crb.sigma[i]) + 1e-9
-
-
-def test_gauge_sd_none_omits_anchor(crb_setup):
-    # Without the gauge anchor (and with a mean-centered, hence gauge-invariant, GP
-    # prior) the gauge stays a null direction -> floored/dropped, reported in null_dim.
-    # A prior alone does NOT pin it: that is why the anchor is not gated on the prior.
-    res = _post(crb_setup, gauge_sd=None, _warn=True)
-    assert res.null_dim >= 1

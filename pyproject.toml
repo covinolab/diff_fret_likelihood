@@ -66,3 +66,6 @@ version = { attr = "diff_fret_likelihood._version.__version__" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "slow: multi-minute statistical tests that simulate their own traces; excluded in CI",
+]

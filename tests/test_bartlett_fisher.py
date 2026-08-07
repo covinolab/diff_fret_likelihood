@@ -48,6 +48,7 @@ import sys
 import time
 
 import numpy as np
+import pytest
 import torch
 from scipy.interpolate import CubicSpline
 
@@ -60,6 +61,18 @@ _ROOT = os.path.dirname(_PKG)                                        # project r
 for _p in (_ROOT,):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# The traces here are SIMULATED, not synthetic, so the compiled extension is required.
+# Under pytest a missing one skips (as in test_simulator_capacity.py) rather than dying
+# with a ModuleNotFoundError inside a fork-pool worker; the __main__ modes below still
+# raise, since there is nothing they can do without it.
+try:
+    import diff_fret_likelihood.simulator  # noqa: F401,E402
+except ImportError as _exc:                                          # no GSL / not built
+    if __name__ != "__main__":
+        pytest.skip(f"the Cython simulator extension is not built ({_exc})",
+                    allow_module_level=True)
+    raise
 
 import diff_fret_likelihood as dfl  # noqa: E402
 from diff_fret_likelihood.config import DTYPE, GridConfig  # noqa: E402
@@ -702,6 +715,10 @@ def grid_sweep(n_traces=N_FULL, grids=(96, 128, 160, 224, 320), device=None):
 # --------------------------------------------------------------------------- #
 # pytest entry point
 # --------------------------------------------------------------------------- #
+# `slow`: 300 traces x 150 ms at dt = 5 us is ~10 min of simulation on a 2-core CI
+# runner (whose cache is always cold), so CI runs `-m "not slow"`. Run it locally --
+# it is the test that proves the likelihood is correctly normalised.
+@pytest.mark.slow
 def test_bartlett_fisher_equilibrium():
     res = run(n_traces=N_TEST, verbose=True)
     ok, failures = verdict(res)
