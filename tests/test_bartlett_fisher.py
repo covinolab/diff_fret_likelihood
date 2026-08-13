@@ -110,7 +110,7 @@ DT_SIM = 5.0e-6                                          # Langevin integration 
 # photophysics (realistic rung): kD=6, eta=.85, backgrounds, crosstalk
 R0 = 6.0
 KD, ETA_G, ETA_R = 6.0, 0.85, 0.85
-K_GB, K_RB = 0.5, 1.0
+BETA_G, BETA_R = 0.425, 0.85                             # DETECTED background (kHz)
 C_GR, C_RG = 0.10, 0.05
 
 # scoring / sizes
@@ -178,7 +178,7 @@ def consts_and_rates(device="cpu"):
         R0=R0, C_gg=1.0 - C_GR, C_gr=C_GR, C_rg=C_RG, C_rr=1.0 - C_RG
     )
     C = consts.crosstalk_tensor(device)
-    rates = EffectiveRates.from_physics(KD, ETA_G, ETA_R, K_GB, K_RB, device=device)
+    rates = EffectiveRates.from_physics(KD, ETA_G, ETA_R, BETA_G, BETA_R, device=device)
     return consts, C, rates
 
 
@@ -271,7 +271,7 @@ def _cache_key(y_knots, log10_D, n_traces):
     h = hashlib.sha1()
     for a in (np.round(y_knots, 8), np.round(x_knots, 8),
               np.array([log10_D, TOTAL_TIME, DT_SIM, N_GRID,
-                        R0, KD, ETA_G, ETA_R, K_GB, K_RB, C_GR, C_RG])):
+                        R0, KD, ETA_G, ETA_R, BETA_G, BETA_R, C_GR, C_RG])):
         h.update(np.ascontiguousarray(a, np.float64).tobytes())
     h.update(f"{n_traces}|s{SEED_OFFSET}".encode())
     return h.hexdigest()[:16]
@@ -293,7 +293,7 @@ def simulate_cached(n_traces, n_workers=24, verbose=True):
         print(f"[cache] miss -> simulating {n_traces} equilibrium traces "
               f"(this is the slow, one-time step)...")
     batch = dfl.simulate.simulate_equilibrium(
-        x_knots, y_knots, D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB, k_rb=K_RB,
+        x_knots, y_knots, D=10.0 ** LOG10_D, R0=R0, kD=KD, beta_g=BETA_G, beta_r=BETA_R,
         eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
         T=TOTAL_TIME, dt=DT_SIM,
         n_traces=n_traces, n_workers=n_workers, seed=SEED_OFFSET,
@@ -738,8 +738,8 @@ def _pilot():
     U = U - U.min()
     print("interior barrier (kT):", round(float(U[(gnp > 5) & (gnp < 7)].max()), 3))
     batch = dfl.simulate.simulate_equilibrium(
-        x_knots, y_true_knots(), D=10.0 ** LOG10_D, R0=R0, kD=KD, k_gb=K_GB,
-        k_rb=K_RB, eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
+        x_knots, y_true_knots(), D=10.0 ** LOG10_D, R0=R0, kD=KD, beta_g=BETA_G,
+        beta_r=BETA_R, eta_g=ETA_G, eta_r=ETA_R, C_gr=C_GR, C_rg=C_RG,
         T=TOTAL_TIME, dt=DT_SIM,
         n_traces=4, n_workers=4, seed=0)
     print("photons/trace:", batch.lengths.tolist())

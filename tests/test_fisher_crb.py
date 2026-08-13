@@ -72,7 +72,7 @@ def crb_setup():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(kD=300.0, eta_g=0.85, eta_r=0.85,
-                                            k_gb=25.0, k_rb=50.0)
+                                            beta_g=21.25, beta_r=42.5)
     D = torch.tensor(10.0)
     batch = _make_batch()
     return dict(batch=batch, grid=grid, pot=pot, D=D, rates=rates,

@@ -106,13 +106,13 @@ def _simulate_chunk(share, budget, seed, params):
         from .simulator import smFRET_simulator as sim
 
     np.random.seed(seed)                        # independent stream for this worker
-    (D, x_knots, y_knots, R0, kD, k_gb, k_rb,
+    (D, x_knots, y_knots, R0, kD, beta_g, beta_r,
      eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, dt) = params
 
     out, tries, n_empty = [], 0, 0
     while len(out) < share and tries < budget:
         tries += 1
-        G, R = sim(D, x_knots, y_knots, R0, kD, k_gb, k_rb,
+        G, R = sim(D, x_knots, y_knots, R0, kD, beta_g, beta_r,
                    eta_g, eta_r, C_gg, C_rr, C_gr, C_rg, T, dt)
         if G is None:                            # aborted: walker left the domain
             continue
@@ -133,7 +133,7 @@ def _simulate_chunk(share, budget, seed, params):
 
 
 def simulate_equilibrium(
-    x_knots, y_knots, D, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg,
+    x_knots, y_knots, D, R0, kD, beta_g, beta_r, eta_g, eta_r, C_gr, C_rg,
     T, dt, *, n_traces, max_tries_factor=4,
     n_workers=None, seed=None, device="cpu", verbose=True,
 ) -> Batch:
@@ -162,7 +162,7 @@ def simulate_equilibrium(
     seeds = [int(s.generate_state(1)[0])
              for s in np.random.SeedSequence(seed).spawn(n_workers)]
 
-    params = (D, x_knots, y_knots, R0, kD, k_gb, k_rb, eta_g, eta_r,
+    params = (D, x_knots, y_knots, R0, kD, beta_g, beta_r, eta_g, eta_r,
               C_gg, C_rr, C_gr, C_rg, T, dt)
 
     t0, raw, n_empty = time.perf_counter(), [], 0

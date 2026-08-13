@@ -75,12 +75,13 @@ R0 = 6.0
 x_knots = np.linspace(2.0, 10.0, 15)                            # nm (wide, self-confining)
 y_knots = 4.0 * (((x_knots - 6.0) / 1.2) ** 2 - 1.0) ** 2       # U(x_knots) in kT: wells 4.8/7.2, 4 kT barrier
 D_true  = 10.0                                                  # nm^2/ms
-kD, eta_g, eta_r, k_gb, k_rb = 6.0, 0.85, 0.85, 0.5, 1.0        # kHz
+kD, eta_g, eta_r = 6.0, 0.85, 0.85                              # kHz, detection efficiencies
+beta_g, beta_r   = 0.425, 0.85                                  # kHz, DETECTED background
 C_gr, C_rg = 0.10, 0.05                                         # crosstalk
 
 # --- simulate photon streams (CPU-only Cython simulator; run before any CUDA) ---
 batch = dfl.simulate.simulate_equilibrium(
-    x_knots, y_knots, D_true, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg,
+    x_knots, y_knots, D_true, R0, kD, beta_g, beta_r, eta_g, eta_r, C_gr, C_rg,
     T=150.0, dt=5e-6, n_traces=64, seed=0,
 )                                                               # -> dfl.simulate.Batch
 
@@ -89,7 +90,7 @@ device = "cpu"                                                  # or "cuda"
 grid   = dfl.GridConfig(x_min=3.5, x_max=8.5, n_grid=160).build(device)
 pot    = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=9), grid).to(device)
 consts = dfl.PhysicsConstants(R0=R0)                            # C_gr=0.10, C_rg=0.05 defaults
-rates  = dfl.EffectiveRates.from_physics(kD, eta_g, eta_r, k_gb, k_rb, device=device)
+rates  = dfl.EffectiveRates.from_physics(kD, eta_g, eta_r, beta_g, beta_r, device=device)
 
 res = dfl.fit(
     batch.to(device), grid, pot,

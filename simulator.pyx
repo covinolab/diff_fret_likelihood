@@ -157,8 +157,8 @@ def photon_capacity(
         double T,
         double dt,
         double kD,
-        double k_gb,
-        double k_rb,
+        double beta_g,
+        double beta_r,
         double eta_g,
         double eta_r,
         double C_gg,
@@ -167,6 +167,8 @@ def photon_capacity(
         double C_rg,
         ):
     """Arrival-time buffer size that ``smFRET_simulator`` cannot overflow.
+
+    ``beta_g``/``beta_r`` are DETECTED background rates (kHz), outside ``eta``.
 
     The emission rates depend on the walker's position only through the FRET
     efficiency ``E(r)``, and ``E`` is confined to ``[0, 1]``.  Since
@@ -196,10 +198,10 @@ def photon_capacity(
             f"photon_capacity: need finite T >= 0 and dt > 0, got T={T}, dt={dt}"
         )
 
-    lam[0] = eta_g * (kD * C_gg + k_gb)          # photons / ms, green at E = 0
-    lam[1] = eta_g * (kD * C_rg + k_gb)          #               green at E = 1
-    lam[2] = eta_r * (kD * C_gr + k_rb)          #               red   at E = 0
-    lam[3] = eta_r * (kD * C_rr + k_rb)          #               red   at E = 1
+    lam[0] = eta_g * kD * C_gg + beta_g          # photons / ms, green at E = 0
+    lam[1] = eta_g * kD * C_rg + beta_g          #               green at E = 1
+    lam[2] = eta_r * kD * C_gr + beta_r          #               red   at E = 0
+    lam[3] = eta_r * kD * C_rr + beta_r          #               red   at E = 1
 
     lam_min = lam[0]
     lam_max = lam[0]
@@ -212,7 +214,7 @@ def photon_capacity(
     if not isfinite(lam_min) or not isfinite(lam_max):
         raise ValueError(
             f"photon_capacity: emission rates are not finite (range [{lam_min}, "
-            f"{lam_max}]); check kD, k_gb, k_rb, eta_g, eta_r and the crosstalk."
+            f"{lam_max}]); check kD, beta_g, beta_r, eta_g, eta_r and the crosstalk."
         )
     # A negative Poisson mean is undefined behaviour in gsl_ran_poisson, so refuse it
     # here rather than let the simulator walk into it at some interior FRET efficiency.
@@ -220,7 +222,7 @@ def photon_capacity(
         raise ValueError(
             f"photon_capacity: emission rate reaches {lam_min:.6g} photons/ms, but a "
             f"Poisson mean cannot be negative.  Check the signs of kD={kD}, "
-            f"k_gb={k_gb}, k_rb={k_rb}, eta_g={eta_g}, eta_r={eta_r}, C_gg={C_gg}, "
+            f"beta_g={beta_g}, beta_r={beta_r}, eta_g={eta_g}, eta_r={eta_r}, C_gg={C_gg}, "
             f"C_rr={C_rr}, C_gr={C_gr}, C_rg={C_rg}."
         )
 
@@ -237,8 +239,8 @@ def smFRET_simulator(
         cnp.ndarray[double] y_knots,
         double R0,
         double kD,
-        double k_gb,
-        double k_rb,
+        double beta_g,
+        double beta_r,
         double eta_g,
         double eta_r,
         double C_gg,
@@ -259,8 +261,11 @@ def smFRET_simulator(
        - φ_g(r) = C_gg*(1-E(r)) + C_rg*E(r)
        - φ_r(r) = C_gr*(1-E(r)) + C_rr*E(r)
     4. Poisson photon statistics:
-       - n_g ~ Poisson(η_g * (k_D * φ_g(r) + k_gb) * dt)
-       - n_r ~ Poisson(η_r * (k_D * φ_r(r) + k_rb) * dt)
+       - n_g ~ Poisson((η_g * k_D * φ_g(r) + β_g) * dt)
+       - n_r ~ Poisson((η_r * k_D * φ_r(r) + β_r) * dt)
+       ``beta_g``/``beta_r`` are DETECTED background rates (kHz), added outside the
+       detector efficiency -- identical to the likelihood's ``mu_G = a_g φ_g + bg_g``
+       with ``a_g = eta_g k_D`` (see ``photophysics.emission_rates``).
        Within each `dt` step, n_g/n_r arrival times are drawn uniformly on
        [i*dt, (i+1)*dt] — statistically exact under the homogeneous-Poisson
        assumption the simulator already commits to per step.
@@ -343,7 +348,7 @@ def smFRET_simulator(
 
     # Output arrays: per-photon arrival times (variable length, capped at `cap`).
     # `cap` is a hard upper bound on either channel's count -- see photon_capacity.
-    cdef long cap = photon_capacity(T, dt, kD, k_gb, k_rb, eta_g, eta_r,
+    cdef long cap = photon_capacity(T, dt, kD, beta_g, beta_r, eta_g, eta_r,
                                     C_gg, C_rr, C_gr, C_rg)
     cdef cnp.ndarray[double] G_times = np.empty(cap, dtype=np.double)
     cdef cnp.ndarray[double] R_times = np.empty(cap, dtype=np.double)
@@ -376,9 +381,11 @@ def smFRET_simulator(
         phi_g = C_gg * (1.0 - E) + C_rg * E
         phi_r = C_gr * (1.0 - E) + C_rr * E
 
-        # Poisson rates for photon emission
-        lambda_g = eta_g * (kD * phi_g + k_gb) * dt
-        lambda_r = eta_r * (kD * phi_r + k_rb) * dt
+        # Poisson rates for photon emission.  The backgrounds are DETECTED rates and
+        # so sit outside eta -- the same convention the likelihood uses
+        # (photophysics.emission_rates: mu_G = a_g phi_g + beta_g, a_g = eta_g kD).
+        lambda_g = (eta_g * kD * phi_g + beta_g) * dt
+        lambda_r = (eta_r * kD * phi_r + beta_r) * dt
 
         # Sample photon counts from Poisson distribution
         n_g = gsl_utils.gsl_ran_poisson(rng, lambda_g)
@@ -425,7 +432,7 @@ def smFRET_simulator(
             f"{overflow_step} of {N} (needed {overflow_need} slots, capacity {cap}). "
             f"photon_capacity() is a hard upper bound on either channel's count, so "
             f"this is a bug in that bound, not a statistical event.  Parameters: "
-            f"T={T}, dt={dt}, kD={kD}, k_gb={k_gb}, k_rb={k_rb}, eta_g={eta_g}, "
+            f"T={T}, dt={dt}, kD={kD}, beta_g={beta_g}, beta_r={beta_r}, eta_g={eta_g}, "
             f"eta_r={eta_r}, C_gg={C_gg}, C_rr={C_rr}, C_gr={C_gr}, C_rg={C_rg}."
         )
 

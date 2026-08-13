@@ -36,14 +36,15 @@ Y_KNOTS = 4.0 * (((X_KNOTS - 6.0) / 1.2) ** 2 - 1.0) ** 2
 D_TRUE, R0, DT = 10.0, 6.0, 5.0e-6
 
 # the reference photophysics (kHz); mirrors the README quick-start
-BASE = dict(kD=6.0, k_gb=0.5, k_rb=1.0, eta_g=0.85, eta_r=0.85, C_gr=0.10, C_rg=0.05)
+BASE = dict(kD=6.0, beta_g=0.425, beta_r=0.85, eta_g=0.85, eta_r=0.85,
+            C_gr=0.10, C_rg=0.05)
 
 
 def _cap(T, **over):
     """``photon_capacity`` in the (C_gr, C_rg) parameterisation the simulator wrapper uses."""
     p = {**BASE, **over}
     C_gg, C_rr = 1.0 - p["C_gr"], 1.0 - p["C_rg"]
-    return photon_capacity(T, DT, p["kD"], p["k_gb"], p["k_rb"],
+    return photon_capacity(T, DT, p["kD"], p["beta_g"], p["beta_r"],
                            p["eta_g"], p["eta_r"], C_gg, C_rr, p["C_gr"], p["C_rg"])
 
 
@@ -51,15 +52,15 @@ def _mean_bound(T, **over):
     """The exact bound on E[count] per channel: ``T * max_channel(rate)``."""
     p = {**BASE, **over}
     C_gg, C_rr = 1.0 - p["C_gr"], 1.0 - p["C_rg"]
-    lam_g = p["eta_g"] * (p["kD"] * max(C_gg, p["C_rg"]) + p["k_gb"])
-    lam_r = p["eta_r"] * (p["kD"] * max(p["C_gr"], C_rr) + p["k_rb"])
+    lam_g = p["eta_g"] * p["kD"] * max(C_gg, p["C_rg"]) + p["beta_g"]
+    lam_r = p["eta_r"] * p["kD"] * max(p["C_gr"], C_rr) + p["beta_r"]
     return T * max(lam_g, lam_r)
 
 
 def _simulate(T, n_traces, seed=0, **over):
     p = {**BASE, **over}
     return dfl.simulate.simulate_equilibrium(
-        X_KNOTS, Y_KNOTS, D_TRUE, R0, p["kD"], p["k_gb"], p["k_rb"],
+        X_KNOTS, Y_KNOTS, D_TRUE, R0, p["kD"], p["beta_g"], p["beta_r"],
         p["eta_g"], p["eta_r"], p["C_gr"], p["C_rg"], T, DT,
         n_traces=n_traces, n_workers=4, seed=seed, device="cpu", verbose=False,
     )
@@ -92,20 +93,20 @@ def test_capacity_is_monotone_in_every_rate_knob():
     assert _cap(300.0) > base                       # longer trace
     assert _cap(150.0, kD=60.0) > base              # brighter dye
     assert _cap(150.0, eta_g=1.0, eta_r=1.0) > base  # better detection
-    assert _cap(150.0, k_gb=50.0) > base            # more background
-    assert _cap(150.0, k_rb=50.0) > base
+    assert _cap(150.0, beta_g=50.0) > base            # more background
+    assert _cap(150.0, beta_r=50.0) > base
 
 
 def test_capacity_stays_positive_in_the_dark_limit():
     # mu -> 0 is where a pure `Z*sqrt(mu)` margin would collapse; the additive slack
     # is what keeps the buffer usable (and a zero-photon trace representable).
-    assert _cap(150.0, kD=0.0, k_gb=0.0, k_rb=0.0) > 0
+    assert _cap(150.0, kD=0.0, beta_g=0.0, beta_r=0.0) > 0
     assert _cap(0.0) > 0
 
 
 @pytest.mark.parametrize("bad", [
     dict(kD=-6.0),          # negative brightness
-    dict(k_rb=-5.0, kD=6.0),  # background so negative the red rate goes negative at low E
+    dict(beta_r=-5.0, kD=6.0),  # background so negative the red rate goes negative at low E
 ])
 def test_negative_poisson_mean_is_refused(bad):
     # gsl_ran_poisson is undefined for a negative mean, so the bound refuses up front
@@ -163,7 +164,7 @@ def test_dim_traces_are_kept_not_rejected():
     that a zero-photon trace is effectively impossible, so nothing is dropped at all.
     """
     T, n = 30.0, 96
-    batch = _simulate(T, n_traces=n, kD=1.0, k_gb=0.05, k_rb=0.05)
+    batch = _simulate(T, n_traces=n, kD=1.0, beta_g=0.05, beta_r=0.05)
     assert batch.n_traces == n
     lengths = batch.lengths.numpy()
     assert lengths.min() > 0                       # no empty traces to drop
@@ -190,4 +191,4 @@ def test_zero_photon_traces_are_dropped_loudly():
     is truncated at zero -- which must not pass silently.
     """
     with pytest.warns(RuntimeWarning, match="zero photons"):
-        _simulate(2.0, n_traces=32, kD=1.0, k_gb=0.05, k_rb=0.05)
+        _simulate(2.0, n_traces=32, kD=1.0, beta_g=0.05, beta_r=0.05)

@@ -5,17 +5,21 @@ likelihood is evaluated with the *same* photon model that generated the data:
 
     E(x)  = R0^6 / (R0^6 + x^6)
     phi_g = C_gg (1-E) + C_rg E,   phi_r = C_gr (1-E) + C_rr E
-    mu_G  = eta_g (kD phi_g + k_gb) = a_g phi_g + bg_g
-    mu_R  = eta_r (kD phi_r + k_rb) = a_r phi_r + bg_r
+    mu_G  = eta_g kD phi_g + beta_g = a_g phi_g + bg_g
+    mu_R  = eta_r kD phi_r + beta_r = a_r phi_r + bg_r
 
-matching ``smFRET_simulator.pyx`` line 160-161 exactly (the background term is
-*inside* the detector-efficiency multiplication).  The identifiable
-brightnesses are ``a_g = eta_g kD``, ``a_r = eta_r kD`` and the effective
-backgrounds are ``bg_g = eta_g k_gb``, ``bg_r = eta_r k_rb``.  The crosstalk
-matrix ``C`` and ``R0`` are fixed calibration.  These four positive rates
-(a_g, a_r, bg_g, bg_r) are the emission parameters exposed to the optimiser;
-the mapping ``mu = a phi + bg`` is fully general regardless of the
-eta/kD/background decomposition.
+matching ``simulator.pyx`` lines 380-381 exactly.  The backgrounds are DETECTED
+rates and are added *outside* the detector efficiency, on both sides -- the
+simulator takes ``beta_g``/``beta_r`` directly, so no conversion exists anywhere.
+The identifiable brightnesses are ``a_g = eta_g kD``, ``a_r = eta_r kD`` and the
+backgrounds are ``bg_g = beta_g``, ``bg_r = beta_r``.  The crosstalk matrix ``C``
+and ``R0`` are fixed calibration.  These four positive rates (a_g, a_r, bg_g,
+bg_r) are the emission parameters exposed to the optimiser; the mapping
+``mu = a phi + bg`` is fully general regardless of the eta/kD decomposition.
+
+``eta_c`` and ``kD`` never appear separately -- only the product ``a_c = eta_c kD``
+is identifiable, which is why ``from_physics`` takes both but stores one number
+per channel.
 
 Everything is vectorised over ``x`` (shape preserving); no per-photon loops.
 """
@@ -35,9 +39,9 @@ class EffectiveRates:
 
     a_g, a_r : donor-excitation brightness reaching green / red detectors
                (= eta_g kD, eta_r kD before crosstalk mixing).
-    bg_g, bg_r : effective green / red background rates (= eta_g k_gb,
-               eta_r k_rb -- background is inside the eta factor in the
-               simulator, see module docstring).
+    bg_g, bg_r : detected green / red background rates (= the simulator's
+               beta_g / beta_r verbatim -- background sits outside the eta
+               factor on both sides, see module docstring).
     """
 
     a_g: torch.Tensor
@@ -46,12 +50,13 @@ class EffectiveRates:
     bg_r: torch.Tensor
 
     @staticmethod
-    def from_physics(kD, eta_g, eta_r, k_gb, k_rb, device="cpu") -> "EffectiveRates":
-        # mu = eta*(kD*phi + k_b): background is multiplied by eta (pyx:160-161).
+    def from_physics(kD, eta_g, eta_r, beta_g, beta_r, device="cpu") -> "EffectiveRates":
+        # mu = eta*kD*phi + beta: the background is already a detected rate and
+        # passes through untouched (simulator.pyx:380-381).
         f = lambda v: torch.as_tensor(float(v), dtype=DTYPE, device=device)
         return EffectiveRates(
             f(eta_g) * f(kD), f(eta_r) * f(kD),
-            f(eta_g) * f(k_gb), f(eta_r) * f(k_rb),
+            f(beta_g), f(beta_r),
         )
 
     def as_dict(self) -> dict:
