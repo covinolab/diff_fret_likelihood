@@ -147,9 +147,26 @@ class PriorConfig:
 
     # --- landscape roughness (improper thin-plate; scaled by this weight) ---
     curvature_weight: float = 0.0  # rho * integral (u'')^2 dx  (grid-invariant units)
+    # "l2" (default, Gaussian: sum d2^2) | "l1" (Laplace / total-variation: sum |d2|).
+    # L1 is edge-preserving: it keeps a few large curvature features (barriers,
+    # intermediates) while suppressing many small wiggles. SplinePotential only.
+    # The two norms live on DIFFERENT scales -- curvature_weight does not carry over.
+    curvature_norm: str = "l2"
     # --- weak Gaussian prior on log D (logD_mean=None -> off) ---
     logD_mean: float | None = None
     logD_std: float = 1.0
+    # --- Gamma prior on the backgrounds, from an independent calibration ---
+    # Everything in kHz, the same units as the rates themselves: `bg_c_mean` is what a
+    # blank / donor-only window measures and `bg_c_sd` is that measurement's error bar.
+    # Each channel is gated by its own mean (`None` -> that channel is unconstrained) and
+    # then REQUIRES its sd -- a mean without an error bar is not a measurement.
+    # Per channel, not shared, because a calibration reports one error bar per detector;
+    # set them equal if yours does not distinguish.  See objective.bg_penalty for the
+    # form, and why this is a Gamma while logD above is a Gaussian.
+    bg_g_mean: float | None = None
+    bg_g_sd: float | None = None
+    bg_r_mean: float | None = None
+    bg_r_sd: float | None = None
     # --- optional weak L2 on potential params (0 -> off) ---
     l2_weight: float = 0.0
     # --- proper GP prior over U(x) (None sigma -> OFF; fully backward-compatible) ---
@@ -167,6 +184,21 @@ class PriorConfig:
             )
         if self.logD_std <= 0:
             raise ValueError(f"logD_std must be > 0, got {self.logD_std}")
+        for _c in ("g", "r"):
+            _m = getattr(self, f"bg_{_c}_mean")
+            _s = getattr(self, f"bg_{_c}_sd")
+            if _m is None:
+                continue
+            if _m <= 0:
+                raise ValueError(f"bg_{_c}_mean is a rate in kHz and must be > 0, got {_m}")
+            if _s is None:
+                raise ValueError(
+                    f"bg_{_c}_mean={_m} was given without bg_{_c}_sd. A calibrated "
+                    f"background needs its error bar (kHz); a mean alone is not a "
+                    f"measurement."
+                )
+            if _s <= 0:
+                raise ValueError(f"bg_{_c}_sd is a rate in kHz and must be > 0, got {_s}")
         if self.l2_weight < 0:
             raise ValueError(f"l2_weight must be >= 0, got {self.l2_weight}")
         if self.gp_sigma is not None:
@@ -198,6 +230,8 @@ class PriorConfig:
             terms.append("curvature")
         if self.logD_mean is not None:
             terms.append("logD")
+        if self.bg_g_mean is not None or self.bg_r_mean is not None:
+            terms.append("bg")
         if self.gp_sigma is not None:
             terms.append("gp")
         if self.l2_weight:

@@ -7,6 +7,7 @@ import torch
 import diff_fret_likelihood as dfl
 from diff_fret_likelihood.forward import build_propagator_from_u, _BasePotential_on_grid
 from diff_fret_likelihood.generator import stationary
+from diff_fret_likelihood.objective import gauge_penalty, neg_log_posterior
 
 
 class _OneTraceBatch:
@@ -57,6 +58,60 @@ def test_forward_backward_consistency():
     times = torch.cumsum(gaps, 0)
     ll = dfl.marginal_loglik(times, cols, float(times[-1]), pot, D, rates, grid, C, consts.R0)
     assert abs(math.log(float(smoothed[0])) - float(ll)) < 1e-8
+
+
+def test_best_loss_matches_objective_at_returned_state():
+    """``best_loss`` must be the objective evaluated AT the state the fit returns.
+
+    Regression: the snapshot used to be taken after ``adam.step()`` while the loss was
+    computed before it, so the reported value belonged to a parameter vector that was
+    never saved -- and the step in between carries the homotopy's *injected noise*, so
+    the two could differ by far more than an ordinary gradient step.
+
+    The settings matter. A SHORT, still-moving fit with LARGE noise (``sigma0=5``,
+    ``polish_frac=0``) is what exposes it: the loss then rises at some steps, so the best
+    step is not the last one and the noisy step taken away from it moves the parameters
+    measurably uphill. Let the fit converge instead and the loss falls monotonically,
+    ``best_state`` is overwritten every step, and the mismatch collapses to zero -- the
+    bug hides completely. Verified to fail pre-fix on 6 consecutive homotopy seeds, the
+    weakest by 147x this tolerance.
+    """
+    torch.manual_seed(0)
+    grid = dfl.GridConfig(4, 8, 24).build()
+    consts = dfl.PhysicsConstants()
+    C = consts.crosstalk_tensor()
+    rates = dfl.EffectiveRates.from_physics(300, .85, .85, 25, 50)
+    n = 60
+    gaps = torch.rand(n) * 0.01
+    gaps[0] = 0.0
+    cols = torch.randint(0, 2, (n,))
+    batch = _OneTraceBatch(gaps, cols, n)
+
+    prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
+                            logD_mean=math.log(10.0), logD_std=0.5)
+    optim = dfl.OptimConfig(adam_steps=20, adam_lr=0.3, log_every=1000)
+    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    with torch.no_grad():
+        pot.theta.copy_(torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4]))
+
+    gauge_sd = 1.0
+    res = dfl.fit(batch, grid, pot, C, consts.R0, D_init=10.0, rates_init=rates,
+                  prior=prior, optim=optim, fit_D=True, verbose=False,
+                  gauge_sd=gauge_sd, sigma0=5.0, polish_frac=0.0, blur="all", seed=0)
+
+    # Rebuild the fit's own objective rather than reimplementing it, so the test cannot
+    # drift from the fit path: neg_log_posterior + gauge_penalty, same as closure_value.
+    with torch.no_grad():
+        recomputed = float(
+            neg_log_posterior(batch.ipt, batch.colors, batch.mask, res.potential,
+                              torch.as_tensor(res.D, dtype=dfl.DTYPE), res.rates,
+                              grid, C, consts.R0, prior)
+            + gauge_penalty(res.potential, grid, gauge_sd)
+        )
+    assert abs(recomputed - res.best_loss) < 1e-6 * max(1.0, abs(res.best_loss)), (
+        f"best_loss={res.best_loss!r} but the objective at the returned state is "
+        f"{recomputed!r} (difference {recomputed - res.best_loss:+.6g})"
+    )
 
 
 def test_fit_enforces_mean_theta_zero_and_preserves_identified():

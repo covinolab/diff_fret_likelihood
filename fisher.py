@@ -360,8 +360,8 @@ class _PriorModule(torch.nn.Module):
         super().__init__()
         self.potential = potential
 
-    def forward(self, D, grid, prior):
-        return prior_penalty(self.potential, D, grid, prior)
+    def forward(self, D, grid, prior, rates=None):
+        return prior_penalty(self.potential, D, grid, prior, rates=rates)
 
 
 def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
@@ -372,14 +372,21 @@ def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
     * the **gauge anchor** (``gauge_sd``) is a choice of coordinates, so it is included
       whenever ``gauge_sd is not None`` — *regardless of* ``prior``.  It is what makes
       the information matrix invertible at all.
-    * the **``PriorConfig`` prior** (curvature / GP / l2, via ``objective.prior_penalty``)
-      and the **Gaussian rate prior** (``rate_sd``) are beliefs about physics, so they
-      opt in together with ``prior``; ``rate_sd`` is ignored when ``prior is None``.
+    * the **``PriorConfig`` prior** (curvature / GP / l2 / logD / bg, via
+      ``objective.prior_penalty``) and the **Gaussian rate prior** (``rate_sd``) are
+      beliefs about physics, so they opt in together with ``prior``; ``rate_sd`` is
+      ignored when ``prior is None``.
+
+    The four log-rates are reconstructed from ``φ[K+1:K+5]`` and handed to
+    ``prior_penalty`` so that a ``PriorConfig`` background prior (``bg_g_mean`` /
+    ``bg_r_mean``) is differentiated here too.  Without that the posterior CRB would
+    silently ignore the prior and report the far wider background-free bound.
 
     With a ``prior`` this reproduces the target ``sample.build_log_prob`` uses (hence
-    HMC) exactly.  Every term is quadratic in ``φ`` so the Hessian is
-    constant; it is taken by autograd double-backward for generality (the same
-    machinery ``_mean_hessian`` uses).
+    HMC) exactly.  The Hessian is taken by autograd double-backward (the same machinery
+    ``_mean_hessian`` uses).  Most terms are quadratic in ``φ`` and so contribute a
+    constant Hessian, but the **bg** term is a Gamma and is NOT — so this must be
+    evaluated AT the MAP, not at any convenient nearby point.
 
     Returns ``None`` if nothing at all is penalised (``prior is None`` and
     ``gauge_sd is None``), which the caller reads as "invert the bare Fisher".
@@ -396,8 +403,11 @@ def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
         out = torch.zeros((), dtype=phi.dtype, device=phi.device)
         if prior is not None:
             D = torch.exp(phi[K])
+            # rebuild the rates from phi so a bg prior is differentiated, not frozen
+            r = torch.exp(phi[K + 1:K + 5])
+            rates_phi = EffectiveRates(r[0], r[1], r[2], r[3])
             out = out + functional_call(module, {"potential.theta": theta},
-                                        args=(D, grid, prior))
+                                        args=(D, grid, prior, rates_phi))
             if rate_sd is not None:
                 log_rates = phi[K + 1:K + 5]
                 out = out + 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()

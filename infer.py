@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from .config import DTYPE, OptimConfig, PriorConfig
-from .objective import neg_log_posterior, gauge_penalty, prior_penalty
+from .objective import neg_log_posterior, gauge_penalty, prior_penalty, bg_penalty
 from .forward import marginal_loglik_batch
 from .photophysics import EffectiveRates
 
@@ -61,18 +61,28 @@ class FitResult:
     free_rates: object = None
 
 
-def _sigma_schedule(n, steps, n_polish, sigma0, noise_tau, shape="exp"):
-    """Annealed noise scale at step n; sigma=0 for the last n_polish (polish) steps."""
+def _sigma_schedule(n, steps, n_polish, sigma0, noise_tau, shape="exp", n_restarts=0):
+    """Annealed noise scale at step n; sigma=0 for the last n_polish (polish) steps.
+
+    For shape="cosine_restarts", the anneal window is split into n_restarts+1
+    equal cosine cycles, each decaying sigma0 -> 0.
+    """
     if n >= steps - n_polish:
         return 0.0
     if shape == "exp":
         return sigma0 * float(np.exp(-n / noise_tau))
+
     n_anneal = max(1, steps - n_polish)
     frac = n / n_anneal
+
     if shape == "linear":
         return sigma0 * max(0.0, 1.0 - frac)
     if shape == "cosine":
         return sigma0 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, frac)))
+    if shape == "cosine_restarts":
+        pos = (n_restarts + 1) * frac       # position in cycle units
+        local = pos - math.floor(pos)       # phase within the current cycle
+        return sigma0 * 0.5 * (1.0 + math.cos(math.pi * local))
     if shape == "sqrt":
         return sigma0 * max(0.0, 1.0 - math.sqrt(min(1.0, frac)))
     if shape == "const":
@@ -101,6 +111,7 @@ def fit(
     polish_frac: float = 0.15,
     blur: str = "all",            # "all" -> U+D+rates ; "ud" -> U+D only ; "none" -> plain Adam
     noise_shape: str = "exp",
+    n_restarts: int = 0,
     seed: int = 0,
 ) -> FitResult:
     """MAP fit by Gaussian homotopy (graduated non-convexity).
@@ -178,10 +189,19 @@ def fit(
         loss = closure_value()
         if not torch.isfinite(loss):
             break
+
+        # INVARIANT: best_loss is the objective evaluated AT best_state. Snapshot here,
+        # BEFORE adam.step() moves the parameters -- taking it afterwards pairs the loss
+        # with the state one step later, and that step carries the injected noise below,
+        # so the two can differ by far more than an ordinary gradient step.
+        if loss < best_loss:
+            best_loss = loss.detach()
+            best_state = [p.detach().clone() for p in params]
+
         loss.backward()
 
         # --- graduated non-convexity: annealed gradient noise on the blur target ---
-        sigma_n = _sigma_schedule(step, steps, n_polish, sigma0, noise_tau, noise_shape)
+        sigma_n = _sigma_schedule(step, steps, n_polish, sigma0, noise_tau, noise_shape, n_restarts)
         if sigma_n > 0 and blurred:
             with torch.no_grad():
                 for p in blurred:
@@ -193,10 +213,6 @@ def fit(
 
         torch.nn.utils.clip_grad_norm_(params, optim.grad_clip)
         adam.step()
-
-        if loss < best_loss:
-            best_loss = loss
-            best_state = [p.detach().clone() for p in params]
 
         if verbose and (step % optim.log_every == 0 or step == steps - 1):
             D_now = float(log_D.exp()) if fit_D else float(D_init)
@@ -343,8 +359,15 @@ def fit_multi(
                 propagate_dtype=optim.propagate_dtype,
             )
             ll = ll_i if ll is None else ll + ll_i
-        return -ll + prior_penalty(potential, D, grid, prior) \
-            + gauge_penalty(potential, grid, gauge_sd)
+        # The shared priors (curvature / logD / GP / l2) are applied ONCE -- see the
+        # note above about not triple-counting them.  The background prior is NOT
+        # shared: every dataset carries its own bg_g/bg_r, so it gets its own term.
+        reg = prior_penalty(potential, D, grid, prior)
+        if prior is not None and (prior.bg_g_mean is not None
+                                  or prior.bg_r_mean is not None):
+            for i in range(len(batches)):
+                reg = reg + bg_penalty(current_rates(i), prior)
+        return -ll + reg + gauge_penalty(potential, grid, gauge_sd)
 
     def _mark_step():
         if optim.compile and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
@@ -360,6 +383,13 @@ def fit_multi(
         loss = closure_value()
         if not torch.isfinite(loss):
             break
+
+        # INVARIANT: best_loss is the objective evaluated AT best_state. Snapshot here,
+        # BEFORE adam.step() moves the parameters (see the matching note in `fit`).
+        if loss < best_loss:
+            best_loss = loss.detach()
+            best_state = [p.detach().clone() for p in params]
+
         loss.backward()
 
         # graduated non-convexity: annealed gradient noise on the blur target
@@ -375,10 +405,6 @@ def fit_multi(
 
         torch.nn.utils.clip_grad_norm_(params, optim.grad_clip)
         adam.step()
-
-        if loss < best_loss:
-            best_loss = loss
-            best_state = [p.detach().clone() for p in params]
 
         if verbose and (step % optim.log_every == 0 or step == steps - 1):
             D_now = float(log_D.exp()) if fit_D else float(D_init)

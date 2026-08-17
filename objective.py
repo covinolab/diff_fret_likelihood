@@ -39,12 +39,24 @@ def curvature_penalty(u_grid: torch.Tensor, dx: float = 1.0) -> torch.Tensor:
     return (d2 ** 2).sum() / (dx ** 3)
 
 
-def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor) -> torch.Tensor:
+def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor,
+                             norm: str = "l2") -> torch.Tensor:
     """Roughness of the *knot heights* — the actual free params.
     Second difference on (possibly non-uniform) knots ~ theta'' at each interior knot.
     This is D2 @ theta; the penalty is ||D2 @ theta||^2 = theta^T (D2^T D2) theta,
     i.e. a GMRF prior with precision rho * D2^T D2. Grid-independent by construction:
     it never touches the fine grid, only the K knots that carry the DOF.
+
+    ``norm="l1"`` switches ``sum d2^2`` -> ``sum |d2|``, i.e. a Laplace (total-variation)
+    prior on the curvature instead of a Gaussian one.  The L2 form shrinks ALL curvature
+    quadratically, so it cannot tell one large real feature (a barrier, an intermediate
+    well) from many small noise wiggles and flattens both -- the same reason Gaussian
+    smoothing blurs edges in image denoising.  The heavy-tailed L1 form suppresses many
+    small values while leaving a few large ones nearly untouched, which matches the
+    structure of a real landscape.  NOTE: the two norms are on different scales, so
+    ``curvature_weight`` does NOT carry over between them -- calibrate it (e.g. match the
+    penalty value at a reference landscape) before comparing.  Non-smooth at d2=0; Adam
+    and the homotopy blur both handle the subgradient fine.
     """
     x = knots_x
     h_left  = x[1:-1] - x[:-2]      # (K-2,)
@@ -53,6 +65,10 @@ def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor) -> torc
     d2 = 2.0 * ( theta[2:]   / (h_right * (h_left + h_right))
                - theta[1:-1] / (h_left * h_right)
                + theta[:-2]  / (h_left  * (h_left + h_right)) )
+    if norm == "l1":
+        return d2.abs().sum()
+    if norm != "l2":
+        raise ValueError(f"curvature norm must be 'l2' or 'l1', got {norm!r}")
     return (d2 ** 2).sum()
 
 
@@ -61,6 +77,48 @@ def logD_penalty(D: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
         return _scalar_zero(D)
     logD = torch.log(D)
     return 0.5 * ((logD - prior.logD_mean) / prior.logD_std) ** 2
+
+
+def bg_penalty(rates, prior: PriorConfig) -> torch.Tensor:
+    """Gamma prior on the background rates, from an independent calibration.
+
+    A background measured by counting is Gamma-distributed *exactly*: ``N`` photons in a
+    blank window of length ``T`` give ``p(beta) ~ beta**N exp(-T beta)``.  So this is not
+    a distributional assumption layered on the calibration -- it IS the calibration's own
+    posterior.  (``logD_penalty`` above is a Gaussian instead, deliberately: a diffusion
+    coefficient is not a counted rate.)
+
+    The fit optimises ``ln bg``, so the Gamma is written as a proper density in THAT
+    coordinate (the Jacobian is kept).  With ``r = bg / mean`` and ``k = (mean / sd)**2``
+    the negative log density is, up to a constant,
+
+        k * (r - ln r - 1)
+
+    which is the Itakura-Saito / KL form and has three properties worth relying on:
+
+    * it is exactly ``0`` at ``bg = mean`` and strictly positive either side, so the
+      step-0 loss offset is exactly the penalty at the init;
+    * its mode sits exactly at ``mean`` -- keeping the Jacobian is what puts it there;
+      a Gamma density in ``bg`` would peak at ``mean * (1 - (sd/mean)**2)``;
+    * its curvature in ``ln bg`` at the mode is exactly ``k``, i.e. the width in ``bg`` is
+      exactly ``sd`` -- so the config's kHz error bar means what it says.
+
+    ``k = (mean/sd)**2`` is the **equivalent photon count** behind the calibration: a
+    blank window yielding ``N`` counts has ``sd/mean = 1/sqrt(N)``, so a +/-10% error bar
+    is 100 counts.  Unlike a Gaussian on ``ln bg`` this carries the correct Gamma skew --
+    a background much HIGHER than measured is strongly excluded (you would have counted
+    more photons), a lower one much less so.
+    """
+    out = None
+    for mean, sd, bg in ((prior.bg_g_mean, prior.bg_g_sd, rates.bg_g),
+                         (prior.bg_r_mean, prior.bg_r_sd, rates.bg_r)):
+        if mean is None:
+            continue
+        k = (mean / sd) ** 2
+        r = bg / mean
+        term = k * (r - torch.log(r) - 1.0)
+        out = term if out is None else out + term
+    return _scalar_zero(rates.bg_g) if out is None else out
 
 
 def _gp_corr(x_ctrl: torch.Tensor, lengthscale: float, kernel: str) -> torch.Tensor:
@@ -186,7 +244,8 @@ def gauge_penalty(potential, grid: torch.Tensor, gauge_sd: float = 1.0) -> torch
     return gauge_penalty_from_offset(gauge_offset(potential, grid), gauge_sd)
 
 
-def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -> torch.Tensor:
+def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
+                  *, rates=None) -> torch.Tensor:
     """Total prior / regulariser penalty ``= -log prior`` (up to a constant).
 
     This is the SINGLE place the prior enters the objective; ``neg_log_posterior``
@@ -205,7 +264,8 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -
     if prior.curvature_weight:
         if isinstance(potential, dfl_potential.SplinePotential):
             reg = reg + prior.curvature_weight * curvature_penalty_spline(
-                potential.theta, potential.knots_x
+                potential.theta, potential.knots_x,
+                norm=getattr(prior, "curvature_norm", "l2"),
             )
         else:
             u_grid = _BasePotential_on_grid(potential, grid)
@@ -213,6 +273,18 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None) -
             reg = reg + prior.curvature_weight * curvature_penalty(u_grid, dx)
     if prior.logD_mean is not None:
         reg = reg + logD_penalty(D, prior)
+    if prior.bg_g_mean is not None or prior.bg_r_mean is not None:
+        # Fail loudly rather than silently skipping: the logD prior was dead for weeks
+        # because a term could go missing without anything complaining (see
+        # tests/test_logD_prior.py).  A caller that configures a bg prior but cannot
+        # supply the rates is asking for something this function cannot deliver.
+        if rates is None:
+            raise ValueError(
+                "prior_penalty: a background prior is configured (bg_g_mean/bg_r_mean) "
+                "but `rates` was not passed, so the term cannot be evaluated. Call "
+                "prior_penalty(..., rates=rates), or clear the bg means."
+            )
+        reg = reg + bg_penalty(rates, prior)
     if prior.gp_sigma is not None:
         reg = reg + gp_penalty(potential, grid, prior)
     if prior.l2_weight:
@@ -236,4 +308,4 @@ def neg_log_posterior(
         ipt, colors, mask, potential, D, rates, grid, C, R0, p0=p0,
         compile_mode=compile_mode, propagate_dtype=propagate_dtype,
     )
-    return -ll + prior_penalty(potential, D, grid, prior)
+    return -ll + prior_penalty(potential, D, grid, prior, rates=rates)
