@@ -63,18 +63,19 @@ def test_forward_backward_consistency():
 def test_best_loss_matches_objective_at_returned_state():
     """``best_loss`` must be the objective evaluated AT the state the fit returns.
 
-    Regression: the snapshot used to be taken after ``adam.step()`` while the loss was
-    computed before it, so the reported value belonged to a parameter vector that was
-    never saved -- and the step in between carries the homotopy's *injected noise*, so
-    the two could differ by far more than an ordinary gradient step.
+    Regression: with ``max_iter=1``, ``LBFGS.step`` returns the loss at the parameters
+    it was ENTERED with and leaves them one quasi-Newton step further -- so pairing that
+    loss with a snapshot taken after the step reports a value belonging to a parameter
+    vector that was never saved (the same off-by-one this test originally caught for the
+    noise-injected Adam loop).  The fit must snapshot BEFORE stepping.
 
-    The settings matter. A SHORT, still-moving fit with LARGE noise (``sigma0=5``,
-    ``polish_frac=0``) is what exposes it: the loss then rises at some steps, so the best
-    step is not the last one and the noisy step taken away from it moves the parameters
-    measurably uphill. Let the fit converge instead and the loss falls monotonically,
-    ``best_state`` is overwritten every step, and the mismatch collapses to zero -- the
-    bug hides completely. Verified to fail pre-fix on 6 consecutive homotopy seeds, the
-    weakest by 147x this tolerance.
+    The settings matter: a non-monotone (overshooting) trajectory is what exposes it,
+    because the best step is then not the last one and the step taken away from it moves
+    the objective measurably.  ``lbfgs_lr=3.0`` forces that on this problem (measured:
+    9 uphill steps, best at step 1, ~0.7-nat mispairing under the bug -- vs a monotone,
+    fully converged run at the default lr where the mismatch collapses to zero and the
+    bug hides completely).  The premise is asserted below so the test cannot silently
+    lose its teeth if the trajectory changes.
     """
     torch.manual_seed(0)
     grid = dfl.GridConfig(4, 8, 24).build()
@@ -89,7 +90,7 @@ def test_best_loss_matches_objective_at_returned_state():
 
     prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
                             logD_mean=math.log(10.0), logD_std=0.5)
-    optim = dfl.OptimConfig(adam_steps=20, adam_lr=0.3, log_every=1000)
+    optim = dfl.OptimConfig(steps=20, lbfgs_lr=3.0, log_every=1)
     pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4]))
@@ -97,7 +98,14 @@ def test_best_loss_matches_objective_at_returned_state():
     gauge_sd = 1.0
     res = dfl.fit(batch, grid, pot, C, consts.R0, D_init=10.0, rates_init=rates,
                   prior=prior, optim=optim, fit_D=True, verbose=False,
-                  gauge_sd=gauge_sd, sigma0=5.0, polish_frac=0.0, blur="all", seed=0)
+                  gauge_sd=gauge_sd)
+
+    # PREMISE: the trajectory must be non-monotone with the best step not the last,
+    # otherwise this test cannot detect a snapshot/loss off-by-one.
+    losses = [h["loss"] for h in res.history[:-1]]
+    assert any(l2 > l1 for l1, l2 in zip(losses, losses[1:])), \
+        "trajectory became monotone -- the pairing test lost its forcing mechanism"
+    assert losses.index(min(losses)) < len(losses) - 1
 
     # Rebuild the fit's own objective rather than reimplementing it, so the test cannot
     # drift from the fit path: neg_log_posterior + gauge_penalty, same as closure_value.
@@ -112,6 +120,49 @@ def test_best_loss_matches_objective_at_returned_state():
         f"best_loss={res.best_loss!r} but the objective at the returned state is "
         f"{recomputed!r} (difference {recomputed - res.best_loss:+.6g})"
     )
+
+
+def test_guard_recovers_and_plateau_stops():
+    """The two safeguards fire and report themselves in ``stop_reason``.
+
+    (1) A step size known to blow up (lr=30 diverges within a few steps here) must end
+    with ``recovered@N``, finite returned params and a finite best_loss.
+    (2) At the safe default lr with a generous step budget, the plateau stop must end
+    the fit long before the ``steps`` cap.
+    """
+    torch.manual_seed(0)
+    grid = dfl.GridConfig(4, 8, 24).build()
+    consts = dfl.PhysicsConstants()
+    C = consts.crosstalk_tensor()
+    rates = dfl.EffectiveRates.from_physics(300, .85, .85, 25, 50)
+    n = 60
+    gaps = torch.rand(n) * 0.01
+    gaps[0] = 0.0
+    cols = torch.randint(0, 2, (n,))
+    batch = _OneTraceBatch(gaps, cols, n)
+    prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
+                            logD_mean=math.log(10.0), logD_std=0.5)
+
+    def fresh_pot():
+        pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+        with torch.no_grad():
+            pot.theta.copy_(torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4]))
+        return pot
+
+    # (1) divergence guard
+    res = dfl.fit(batch, grid, fresh_pot(), C, consts.R0, D_init=10.0,
+                  rates_init=rates, prior=prior, fit_D=True, verbose=False,
+                  optim=dfl.OptimConfig(steps=20, lbfgs_lr=30.0, log_every=1))
+    assert res.stop_reason.startswith("recovered@"), res.stop_reason
+    assert torch.isfinite(res.potential.theta).all()
+    assert math.isfinite(res.best_loss) and math.isfinite(res.D)
+
+    # (2) plateau stop (or LBFGS's own convergence): well before the cap
+    res = dfl.fit(batch, grid, fresh_pot(), C, consts.R0, D_init=10.0,
+                  rates_init=rates, prior=prior, fit_D=True, verbose=False,
+                  optim=dfl.OptimConfig(steps=600, log_every=1))
+    assert res.stop_reason.startswith(("plateau@", "converged@")), res.stop_reason
+    assert res.history[-1]["step"] < 599
 
 
 def test_fit_enforces_mean_theta_zero_and_preserves_identified():
@@ -138,7 +189,9 @@ def test_fit_enforces_mean_theta_zero_and_preserves_identified():
     # D-valley blow-up on tiny data); none of these terms constrain the offset.
     prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
                             logD_mean=math.log(10.0), logD_std=0.5)
-    optim = dfl.OptimConfig(adam_steps=1500, adam_lr=0.05, log_every=200)
+    # tight stop_min_delta: the gauge term is tiny in nats, so the default 0.1-nat
+    # plateau threshold would stop the fit before mean(theta) is pinned to < 5e-3.
+    optim = dfl.OptimConfig(steps=600, stop_min_delta=1e-3, log_every=200)
     init_theta = torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4])
 
     def fresh_pot():
@@ -147,14 +200,14 @@ def test_fit_enforces_mean_theta_zero_and_preserves_identified():
             pot.theta.copy_(init_theta)
         return pot
 
-    # blur="none" -> plain deterministic Adam (no homotopy noise), so the two fits
-    # differ only by the gauge anchor, as the test intends.
+    # the guarded LBFGS loop is deterministic, so the two fits differ only by the
+    # gauge anchor, as the test intends.
     res_anchor = dfl.fit(batch, grid, fresh_pot(), C, consts.R0, D_init=10.0,
                          rates_init=rates, prior=prior, optim=optim, fit_D=True,
-                         verbose=False, gauge_sd=1.0, blur="none")
+                         verbose=False, gauge_sd=1.0)
     res_base = dfl.fit(batch, grid, fresh_pot(), C, consts.R0, D_init=10.0,
                        rates_init=rates, prior=prior, optim=optim, fit_D=True,
-                       verbose=False, gauge_sd=1e6, blur="none")
+                       verbose=False, gauge_sd=1e6)
 
     # (1) the anchor pins the enforcement gauge mean(theta)=0; the baseline does not
     #     (nothing else constrains the offset, so the baseline stays near its init mean).

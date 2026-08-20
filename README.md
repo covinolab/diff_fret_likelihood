@@ -105,10 +105,15 @@ print(res.D, res.best_loss)
 ```
 
 `fit` returns a `FitResult` (`.potential`, `.D`, `.rates`, `.best_loss`,
-`.history`). It runs Adam with a graduated-non-convexity (annealed gradient noise)
-schedule to escape high-barrier basin traps; set `blur="none"` for plain Adam.
-Tune the schedule via `optim=dfl.OptimConfig(adam_steps=..., adam_lr=...)`
-(defaults: 300 steps, `lr=0.03`).
+`.history`, `.stop_reason`). It runs a guarded LBFGS: one quasi-Newton step per
+outer step (`max_iter=1`, **no line search** -- strong-Wolfe returns a zero step
+on this objective), with a best-loss snapshot restored on any non-finite
+loss/parameter and a plateau stop once the best loss stops improving.
+`stop_reason` is `"plateau@N"`, `"recovered@N"` (non-finite hit; best snapshot
+restored), `"converged@N"` (LBFGS internal tolerance) or `"max_steps"`. Tune via
+`optim=dfl.OptimConfig(steps=...,
+lbfgs_lr=..., stop_patience=..., stop_min_delta=...)` (defaults: 600-step cap,
+`lr=1.0`, patience 50, 0.1 nats).
 
 ## Posterior sampling (HMC)
 
@@ -292,7 +297,7 @@ steep landscapes; gradients still flow.
 | `generator.py` | detailed-balance Smoluchowski `L`; symmetrisation; validity checks |
 | `forward.py` | marginal log-likelihood (eigendecomp propagator, single + batched); robust `eigh`; compile / fp32 paths |
 | `objective.py` | `neg_log_posterior` (marginal + priors); curvature / GP / `logD` / L2 priors; the gauge anchor |
-| `infer.py` | `fit` (Adam + graduated non-convexity MAP); `recovered_potential` |
+| `infer.py` | `fit` / `fit_multi` (guarded-LBFGS MAP, plateau stop); `recovered_potential` |
 | `fisher.py` | `cramer_rao_bound`: Fisher information and CRB (pure or posterior) |
 | `reconstruct.py` | backward filter `β`; smoothing posterior over `x(t)` with error bands; exact posterior sample paths |
 | `sample.py` | HMC/NUTS posterior sampling of `U(x)`, `D`, rates (single / multi-chain) |

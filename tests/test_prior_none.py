@@ -128,7 +128,7 @@ def test_fit_prior_none_smoke():
     )
     # fit returns the best-loss iterate (loss is evaluated at the init params on the
     # first step), so the reported MLE loss can never exceed the initial loss.
-    optim = dfl.OptimConfig(adam_steps=5, adam_lr=0.5, log_every=1)
+    optim = dfl.OptimConfig(steps=5, log_every=1)
     res = dfl.fit(
         batch, grid, pot, C, consts.R0, D_init=10.0, rates_init=rates,
         prior=None, optim=optim, fit_D=True, verbose=False,

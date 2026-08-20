@@ -1,9 +1,9 @@
 """``FreeRates(fit_bg=False)`` freezes the background rates but not the brightnesses.
 
 Used to calibrate out a known background instead of inferring it jointly.  The frozen
-pair must be invisible to ``parameters()`` -- both the optimiser param list and the
-homotopy blur list in ``infer.fit`` are built from it -- while still surviving ``.to()``
-and still producing the right values from ``build()``.
+pair must be invisible to ``parameters()`` -- the optimiser param list in ``infer.fit``
+is built from it -- while still surviving ``.to()`` and still producing the right
+values from ``build()``.
 """
 
 import torch

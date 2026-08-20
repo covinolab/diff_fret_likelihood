@@ -246,11 +246,21 @@ class PriorConfig:
 
 @dataclass
 class OptimConfig:
-    """Adam optimisation with a graduated-non-convexity polish phase (SPEC section 7.6)."""
+    """Guarded LBFGS with plateau stopping.
 
-    adam_steps: int = 300
-    adam_lr: float = 0.03
-    grad_clip: float = 1.0
+    Each step is ONE quasi-Newton step (``max_iter=1``; the L-BFGS curvature
+    history persists across calls), so the non-finite guard and the plateau stop
+    act between every step.  The fit stops once the best loss has not
+    improved by more than ``stop_min_delta`` nats within ``stop_patience`` steps;
+    any non-finite loss/param restores the best snapshot and stops.  See
+    ``infer._lbfgs_fit``.
+    """
+
+    steps: int = 600            # hard cap; the plateau stop usually fires first
+    lbfgs_lr: float = 1.0       # 1.0 is the measured-safe step; 0.1 diverged late
+    history_size: int = 100
+    stop_patience: int = 50     # stop when best loss unimproved for this many steps...
+    stop_min_delta: float = 0.1  # ...by more than this many nats
     log_every: int = 25
     compile: bool = False
     compile_mode: str = "default"

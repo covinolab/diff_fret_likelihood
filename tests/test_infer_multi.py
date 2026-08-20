@@ -66,17 +66,18 @@ def _rates(kD=300.0):
 # 1. single-dataset equivalence -- the anchor against loop drift
 # --------------------------------------------------------------------------- #
 def test_fit_multi_single_dataset_matches_fit():
-    """fit_multi with one-element lists is bit-identical to fit (same seed/knobs)."""
+    """fit_multi with one-element lists is bit-identical to fit (same knobs; the
+    guarded LBFGS loop is deterministic)."""
     grid = _grid()
     b = _tiny_batch()
     C = dfl.PhysicsConstants().crosstalk_tensor()
     R0 = dfl.PhysicsConstants().R0
     rates = _rates()
     prior = dfl.PriorConfig(curvature_weight=0.05)
-    optim = dfl.OptimConfig(adam_steps=8, adam_lr=0.1, log_every=1)
+    optim = dfl.OptimConfig(steps=8, log_every=1)
 
     common = dict(D_init=10.0, prior=prior, optim=optim, fit_D=True,
-                  fit_rates=True, verbose=False, seed=0)
+                  fit_rates=True, verbose=False)
 
     pot_a, pot_b = _fresh_pot(grid), _fresh_pot(grid)
     res_single = dfl.fit(b, grid, pot_a, C, R0, rates_init=rates, **common)
@@ -102,10 +103,11 @@ def test_fit_multi_prior_counted_once():
     rates = _rates()
     prior = dfl.PriorConfig(curvature_weight=0.1)
 
-    # best_loss with adam_steps=1 is exactly the loss at the initial parameters.
-    optim = dfl.OptimConfig(adam_steps=1, adam_lr=0.1, log_every=1)
+    # best_loss with steps=1 is exactly the loss at the initial parameters (the
+    # snapshot is taken BEFORE the quasi-Newton step moves them).
+    optim = dfl.OptimConfig(steps=1, log_every=1)
     common = dict(D_init=10.0, optim=optim, fit_D=True, fit_rates=True,
-                  sigma0=0.0, verbose=False, seed=0)
+                  verbose=False)
 
     n_ds = 3
     loss_on = dfl.fit_multi([b] * n_ds, grid, _fresh_pot(grid), [C] * n_ds,
@@ -130,12 +132,12 @@ def test_fit_multi_rates_independent():
     b = _tiny_batch()
     C = dfl.PhysicsConstants().crosstalk_tensor()
     rates0, rates1 = _rates(kD=100.0), _rates(kD=500.0)
-    optim = dfl.OptimConfig(adam_steps=12, adam_lr=0.1, log_every=1)
+    optim = dfl.OptimConfig(steps=12, log_every=1)
 
     res = dfl.fit_multi(
         [b, b], grid, _fresh_pot(grid), [C, C], [5.0, 6.0], D_init=10.0,
         rates_init_list=[rates0, rates1], prior=None, optim=optim,
-        fit_D=True, fit_rates=True, verbose=False, seed=0,
+        fit_D=True, fit_rates=True, verbose=False,
     )
 
     assert len(res.rates) == 2
@@ -156,12 +158,12 @@ def test_fit_multi_fit_rates_false_keeps_inits():
     rates0, rates1 = _rates(kD=100.0), _rates(kD=500.0)
     pot = _fresh_pot(grid)
     theta0 = pot.theta.detach().clone()
-    optim = dfl.OptimConfig(adam_steps=10, adam_lr=0.1, log_every=1)
+    optim = dfl.OptimConfig(steps=10, log_every=1)
 
     res = dfl.fit_multi(
         [b, b], grid, pot, [C, C], [5.0, 6.0], D_init=10.0,
         rates_init_list=[rates0, rates1], prior=None, optim=optim,
-        fit_D=True, fit_rates=False, verbose=False, seed=0,
+        fit_D=True, fit_rates=False, verbose=False,
     )
 
     for got, init in zip(res.rates, [rates0, rates1]):

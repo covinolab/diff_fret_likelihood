@@ -2,8 +2,11 @@
 
 Unconstrained parameterisation: optimise ``log D`` and (optionally)
 ``log a_g, log a_r, log bg_g, log bg_r`` freely; map back with ``exp``.  The MLP
-potential parameters are optimised directly.  Adam warmup (stable) then LBFGS
-with strong-Wolfe line search (smooth MLE endgame).
+potential parameters are optimised directly.  Optimiser: guarded LBFGS with NO
+line search (strong-Wolfe returns a zero step on this objective and strands the
+fit ~8 nats short) -- one quasi-Newton step per outer iteration (``max_iter=1``;
+the curvature history persists across calls), so a non-finite guard with
+best-snapshot restore and a plateau stop act between every step.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 
 from .config import DTYPE, OptimConfig, PriorConfig
@@ -26,8 +28,8 @@ class FreeRates(torch.nn.Module):
     ``fit_bg=False`` freezes the two background rates at their ``init`` values (they
     become buffers, not parameters) while the brightnesses ``a_g``/``a_r`` stay free.
     Because the frozen pair is registered as buffers, ``parameters()`` -- which the
-    optimiser and the homotopy blur list are both built from -- excludes them
-    automatically, and ``.to(device)`` still moves them.
+    optimiser param list is built from -- excludes them automatically, and
+    ``.to(device)`` still moves them.
     """
 
     def __init__(self, init: EffectiveRates, fit_bg: bool = True):
@@ -57,37 +59,93 @@ class FitResult:
     rates: EffectiveRates
     best_loss: float
     history: list = field(default_factory=list)
+    stop_reason: str = ""
     log_D_param: object = None
     free_rates: object = None
 
 
-def _sigma_schedule(n, steps, n_polish, sigma0, noise_tau, shape="exp", n_restarts=0):
-    """Annealed noise scale at step n; sigma=0 for the last n_polish (polish) steps.
+def _lbfgs_fit(params, closure_value, optim, verbose, d_of):
+    """Guarded LBFGS driver shared by ``fit``/``fit_multi``.
 
-    For shape="cosine_restarts", the anneal window is split into n_restarts+1
-    equal cosine cycles, each decaying sigma0 -> 0.
+    ``max_iter=1`` inside the Python loop: LBFGS keeps its curvature history across
+    ``step()`` calls (numerically equivalent to a single long call), while the
+    non-finite guard, the best snapshot and the plateau stop act between every
+    quasi-Newton step.  NEVER pass a line search: strong-Wolfe returns a zero step
+    on this objective and strands the fit ~8 nats short.  No gradient clipping
+    either -- clipping inside the closure would corrupt the curvature pairs.
+
+    Returns ``(best_loss, history, stop_reason)``.  On EVERY exit path the params
+    hold the best-observed state (the untouched entry params if the very first
+    loss is already non-finite).  ``d_of`` is a zero-arg callable returning the
+    current D as float (logging only).
     """
-    if n >= steps - n_polish:
-        return 0.0
-    if shape == "exp":
-        return sigma0 * float(np.exp(-n / noise_tau))
+    opt = torch.optim.LBFGS(params, lr=optim.lbfgs_lr, max_iter=1,
+                            history_size=optim.history_size, line_search_fn=None)
 
-    n_anneal = max(1, steps - n_polish)
-    frac = n / n_anneal
+    def closure():
+        if optim.compile and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        opt.zero_grad()
+        loss = closure_value()
+        loss.backward()
+        return loss
 
-    if shape == "linear":
-        return sigma0 * max(0.0, 1.0 - frac)
-    if shape == "cosine":
-        return sigma0 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, frac)))
-    if shape == "cosine_restarts":
-        pos = (n_restarts + 1) * frac       # position in cycle units
-        local = pos - math.floor(pos)       # phase within the current cycle
-        return sigma0 * 0.5 * (1.0 + math.cos(math.pi * local))
-    if shape == "sqrt":
-        return sigma0 * max(0.0, 1.0 - math.sqrt(min(1.0, frac)))
-    if shape == "const":
-        return sigma0
-    raise ValueError(f"unknown noise shape {shape!r}")
+    best_loss, best_state, best_step = float("inf"), None, -1
+    last_reset = -1     # patience clock; only > stop_min_delta improvements reset it
+    history, stop_reason, step = [], "max_steps", -1
+    for step in range(optim.steps):
+        # INVARIANT: best_loss is the objective evaluated AT best_state.  With
+        # max_iter=1, opt.step returns the loss at the params it was entered with
+        # and leaves them one quasi-Newton step further -- so snapshot first.
+        prev = [p.detach().clone() for p in params]
+        D_at_loss = d_of()           # history pairs (loss, D) at the SAME state
+        loss = float(opt.step(closure))
+
+        # Bookkeep BEFORE the guard: a finite loss was measured at `prev`, which
+        # predates whatever the step just did to the params, so it is safe to
+        # keep even when that step exploded.  Any gain updates the snapshot; only
+        # a gain > stop_min_delta extends the run (otherwise sub-threshold
+        # dribble keeps the fit alive forever).
+        if math.isfinite(loss) and loss < best_loss:
+            if loss < best_loss - optim.stop_min_delta:
+                last_reset = step
+            best_loss, best_state, best_step = loss, prev, step
+
+        # GUARD: fixed-step LBFGS has no descent guarantee; observed divergences
+        # are late and not bit-reproducible, so check every step.
+        if not (math.isfinite(loss)
+                and all(bool(torch.isfinite(p).all()) for p in params)):
+            if best_state is None:   # first loss already non-finite: keep the
+                best_state = prev    # entry (init) params, not the blown-up ones
+            stop_reason = f"recovered@{best_step}"
+            break
+
+        if step - last_reset >= optim.stop_patience:
+            stop_reason = f"plateau@{step}"
+            break
+
+        if all(torch.equal(p, q) for p, q in zip(params, prev)):
+            # LBFGS hit an internal tolerance and stopped moving the params; every
+            # further step() would re-evaluate the objective for nothing.
+            stop_reason = f"converged@{step}"
+            break
+
+        if step % optim.log_every == 0:
+            history.append({"step": step, "loss": loss, "D": D_at_loss})
+            if verbose:
+                print(f"  [lbfgs {step:4d}] loss={loss:.3f}  D={D_at_loss:.3f}  "
+                      f"best={best_loss:.3f}")
+
+    if best_state is not None:
+        with torch.no_grad():
+            for p, p_best in zip(params, best_state):
+                p.copy_(p_best)
+
+    # final entry describes the RETURNED (restored-best) state.
+    history.append({"step": step, "loss": best_loss, "D": d_of()})
+    if verbose:
+        print(f"  [lbfgs] stop: {stop_reason}  best={best_loss:.3f}  D={d_of():.3f}")
+    return best_loss, history, stop_reason
 
 
 def fit(
@@ -105,22 +163,23 @@ def fit(
     fit_bg: bool = True,
     verbose: bool = True,
     gauge_sd: float = 1.0,
-    # ---- Gaussian-homotopy knobs (graduated non-convexity; ON by default) ----
-    sigma0: float = 1.0,
-    noise_tau: float | None = None,
-    polish_frac: float = 0.15,
-    blur: str = "all",            # "all" -> U+D+rates ; "ud" -> U+D only ; "none" -> plain Adam
-    noise_shape: str = "exp",
-    n_restarts: int = 0,
-    seed: int = 0,
 ) -> FitResult:
-    """MAP fit by Gaussian homotopy (graduated non-convexity).
+    """MAP fit by guarded LBFGS (no line search).
 
-    Identical interface/return to the plain-Adam ``fit``, but the Adam warmup runs a
-    homotopy schedule: annealed gradient noise (sigma0 -> 0) on the ``blur`` target,
-    with a noise-free polish tail (last ``polish_frac`` of ``optim.adam_steps``).  This
-    escapes the high-barrier basin trap that plain Adam collapses into.  Set
-    ``blur="none"`` (or ``sigma0=0``) to recover the original plain-Adam behaviour.
+    Each step is one quasi-Newton step (see :func:`_lbfgs_fit`), with two
+    safeguards acting between steps:
+
+    - **guard**: a best-loss snapshot is kept and restored on any non-finite loss
+      or parameter;
+    - **plateau stop**: the fit ends once the best loss has not improved by more
+      than ``optim.stop_min_delta`` nats within ``optim.stop_patience`` steps
+      (smaller gains still update the snapshot but do not extend the run).
+
+    ``FitResult.stop_reason`` records the exit path: ``"plateau@{step}"``,
+    ``"recovered@{best_step}"`` (non-finite hit; best snapshot restored --
+    ``@-1`` means the very first loss was non-finite and the init was kept),
+    ``"converged@{step}"`` (LBFGS hit an internal tolerance and stopped moving)
+    or ``"max_steps"`` (``optim.steps`` reached).
 
     ``fit_bg=False`` (only meaningful with ``fit_rates=True``) holds ``bg_g``/``bg_r``
     at their ``rates_init`` values while ``a_g``/``a_r`` stay free -- for calibrating
@@ -129,7 +188,6 @@ def fit(
     optim = optim or OptimConfig()
     device = grid.device
     ipt, colors, mask = batch.ipt, batch.colors, batch.mask
-    gen = torch.Generator(device=device).manual_seed(int(seed))
 
     log_D = torch.tensor(
         float(torch.log(torch.as_tensor(D_init, dtype=DTYPE))),
@@ -146,24 +204,6 @@ def fit(
     if fit_rates:
         params += list(free_rates.parameters())
 
-    # which of the optimised params receive the annealed noise
-    if blur == "all":
-        blurred = (list(potential.parameters())
-                   + ([log_D] if fit_D else [])
-                   + (list(free_rates.parameters()) if fit_rates else []))
-    elif blur == "ud":
-        blurred = list(potential.parameters()) + ([log_D] if fit_D else [])
-    elif blur == "none":
-        blurred = []
-    else:
-        raise ValueError(f"unknown blur {blur!r}")
-
-    steps = optim.adam_steps
-    n_polish = int(round(polish_frac * steps))
-    if noise_tau is None:
-        noise_tau = max(1.0, steps / 4.0)
-
-    history = []
     compile_mode = optim.compile_mode if optim.compile else None
 
     def closure_value():
@@ -175,59 +215,11 @@ def fit(
         )
         return nlp + gauge_penalty(potential, grid, gauge_sd)
 
-    def _mark_step():
-        if optim.compile and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
-
-    adam = torch.optim.Adam(params, lr=optim.adam_lr)
-    best_loss = float("inf")
-    best_state = None
-
-    for step in range(steps):
-        _mark_step()
-        adam.zero_grad()
-        loss = closure_value()
-        if not torch.isfinite(loss):
-            break
-
-        # INVARIANT: best_loss is the objective evaluated AT best_state. Snapshot here,
-        # BEFORE adam.step() moves the parameters -- taking it afterwards pairs the loss
-        # with the state one step later, and that step carries the injected noise below,
-        # so the two can differ by far more than an ordinary gradient step.
-        if loss < best_loss:
-            best_loss = loss.detach()
-            best_state = [p.detach().clone() for p in params]
-
-        loss.backward()
-
-        # --- graduated non-convexity: annealed gradient noise on the blur target ---
-        sigma_n = _sigma_schedule(step, steps, n_polish, sigma0, noise_tau, noise_shape, n_restarts)
-        if sigma_n > 0 and blurred:
-            with torch.no_grad():
-                for p in blurred:
-                    if p.grad is None:
-                        continue
-                    scale = p.grad.abs().mean() + 1e-12
-                    p.grad.add_(sigma_n * scale * torch.randn(
-                        p.grad.shape, generator=gen, device=device, dtype=p.grad.dtype))
-
-        torch.nn.utils.clip_grad_norm_(params, optim.grad_clip)
-        adam.step()
-
-        if verbose and (step % optim.log_every == 0 or step == steps - 1):
-            D_now = float(log_D.exp()) if fit_D else float(D_init)
-            history.append({"phase": "homotopy", "step": step, "sigma": sigma_n,
-                            "loss": float(loss), "D": D_now})
-            print(f"  [gh {step:4d}] sigma={sigma_n:.3f} loss={float(loss):.3f}  "
-                  f"D={D_now:.3f} best_loss={float(best_loss):.3f}")
-
-    if best_state is not None:
-        with torch.no_grad():
-            for p, p_best in zip(params, best_state):
-                p.copy_(p_best)
+    d_of = (lambda: float(log_D.exp())) if fit_D else (lambda: float(D_init))
+    best_loss, history, stop_reason = _lbfgs_fit(
+        params, closure_value, optim, verbose, d_of)
 
     with torch.no_grad():
-        best_loss = float(best_loss)
         D_final = float(log_D.exp()) if fit_D else float(D_init)
         rates_final = current_rates()
 
@@ -237,6 +229,7 @@ def fit(
         rates=EffectiveRates(*(r.detach() for r in (rates_final.a_g, rates_final.a_r, rates_final.bg_g, rates_final.bg_r))),
         best_loss=best_loss,
         history=history,
+        stop_reason=stop_reason,
         log_D_param=log_D if fit_D else None,
         free_rates=free_rates,
     )
@@ -256,13 +249,6 @@ def fit_multi(
     fit_rates: bool = True,
     verbose: bool = True,
     gauge_sd: float = 1.0,
-    # ---- Gaussian-homotopy knobs (identical semantics to ``fit``) ----
-    sigma0: float = 1.0,
-    noise_tau: float | None = None,
-    polish_frac: float = 0.15,
-    blur: str = "all",
-    noise_shape: str = "exp",
-    seed: int = 0,
 ) -> FitResult:
     """Joint MAP fit of ONE shared ``(U, D)`` across several datasets.
 
@@ -285,10 +271,12 @@ def fit_multi(
 
     Interface mirrors :func:`fit` -- ``batch``/``C``/``R0``/``rates_init`` are simply
     pluralised into equal-length lists; everything shared (``grid``, ``potential``,
-    ``D_init``, ``prior``, optimiser knobs) stays scalar.  ``fit_rates`` defaults to
-    ``True`` here (it is ``False`` in :func:`fit`): per-dataset photophysics is the whole
-    reason to call this.  With a single-element list ``fit_multi`` is bit-identical to
-    :func:`fit` (same parameter order, same RNG draw).
+    ``D_init``, ``prior``, optimiser knobs) stays scalar.  The optimiser is the same
+    guarded LBFGS (see :func:`fit` for the safeguards and ``stop_reason`` values).
+    ``fit_rates`` defaults to ``True`` here (it is ``False`` in :func:`fit`):
+    per-dataset photophysics is the whole reason to call this.  With a single-element
+    list ``fit_multi`` is bit-identical to :func:`fit` (same parameter order; the
+    guarded LBFGS loop is deterministic).
 
     Returns a :class:`FitResult` whose ``rates`` is a ``list[EffectiveRates]`` (one per
     dataset, input order) and whose ``free_rates`` is a ``list[FreeRates]`` (or ``None``
@@ -307,7 +295,6 @@ def fit_multi(
     optim = optim or OptimConfig()
     device = grid.device
     batches = [b.to(device) for b in batches]
-    gen = torch.Generator(device=device).manual_seed(int(seed))
 
     log_D = torch.tensor(
         float(torch.log(torch.as_tensor(D_init, dtype=DTYPE))),
@@ -327,26 +314,6 @@ def fit_multi(
         for fr in free_rates_list:
             params += list(fr.parameters())
 
-    # which optimised params receive the annealed noise (same rule as ``fit``,
-    # extended over every dataset's rate block)
-    if blur == "all":
-        blurred = list(potential.parameters()) + ([log_D] if fit_D else [])
-        if fit_rates:
-            for fr in free_rates_list:
-                blurred += list(fr.parameters())
-    elif blur == "ud":
-        blurred = list(potential.parameters()) + ([log_D] if fit_D else [])
-    elif blur == "none":
-        blurred = []
-    else:
-        raise ValueError(f"unknown blur {blur!r}")
-
-    steps = optim.adam_steps
-    n_polish = int(round(polish_frac * steps))
-    if noise_tau is None:
-        noise_tau = max(1.0, steps / 4.0)
-
-    history = []
     compile_mode = optim.compile_mode if optim.compile else None
 
     def closure_value():
@@ -369,57 +336,11 @@ def fit_multi(
                 reg = reg + bg_penalty(current_rates(i), prior)
         return -ll + reg + gauge_penalty(potential, grid, gauge_sd)
 
-    def _mark_step():
-        if optim.compile and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
-
-    adam = torch.optim.Adam(params, lr=optim.adam_lr)
-    best_loss = float("inf")
-    best_state = None
-
-    for step in range(steps):
-        _mark_step()
-        adam.zero_grad()
-        loss = closure_value()
-        if not torch.isfinite(loss):
-            break
-
-        # INVARIANT: best_loss is the objective evaluated AT best_state. Snapshot here,
-        # BEFORE adam.step() moves the parameters (see the matching note in `fit`).
-        if loss < best_loss:
-            best_loss = loss.detach()
-            best_state = [p.detach().clone() for p in params]
-
-        loss.backward()
-
-        # graduated non-convexity: annealed gradient noise on the blur target
-        sigma_n = _sigma_schedule(step, steps, n_polish, sigma0, noise_tau, noise_shape)
-        if sigma_n > 0 and blurred:
-            with torch.no_grad():
-                for p in blurred:
-                    if p.grad is None:
-                        continue
-                    scale = p.grad.abs().mean() + 1e-12
-                    p.grad.add_(sigma_n * scale * torch.randn(
-                        p.grad.shape, generator=gen, device=device, dtype=p.grad.dtype))
-
-        torch.nn.utils.clip_grad_norm_(params, optim.grad_clip)
-        adam.step()
-
-        if verbose and (step % optim.log_every == 0 or step == steps - 1):
-            D_now = float(log_D.exp()) if fit_D else float(D_init)
-            history.append({"phase": "homotopy", "step": step, "sigma": sigma_n,
-                            "loss": float(loss), "D": D_now})
-            print(f"  [gh {step:4d}] sigma={sigma_n:.3f} loss={float(loss):.3f}  "
-                  f"D={D_now:.3f} best_loss={float(best_loss):.3f}")
-
-    if best_state is not None:
-        with torch.no_grad():
-            for p, p_best in zip(params, best_state):
-                p.copy_(p_best)
+    d_of = (lambda: float(log_D.exp())) if fit_D else (lambda: float(D_init))
+    best_loss, history, stop_reason = _lbfgs_fit(
+        params, closure_value, optim, verbose, d_of)
 
     with torch.no_grad():
-        best_loss = float(best_loss)
         D_final = float(log_D.exp()) if fit_D else float(D_init)
         rates_final = [current_rates(i) for i in range(n)]
         rates_out = [
@@ -433,6 +354,7 @@ def fit_multi(
         rates=rates_out,
         best_loss=best_loss,
         history=history,
+        stop_reason=stop_reason,
         log_D_param=log_D if fit_D else None,
         free_rates=free_rates_list,
     )
@@ -451,7 +373,3 @@ def recovered_potential(potential, grid) -> torch.Tensor:
     """
     u = potential.on_grid(grid)
     return u - u.mean()
-
-
-
-

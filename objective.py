@@ -55,8 +55,8 @@ def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor,
     small values while leaving a few large ones nearly untouched, which matches the
     structure of a real landscape.  NOTE: the two norms are on different scales, so
     ``curvature_weight`` does NOT carry over between them -- calibrate it (e.g. match the
-    penalty value at a reference landscape) before comparing.  Non-smooth at d2=0; Adam
-    and the homotopy blur both handle the subgradient fine.
+    penalty value at a reference landscape) before comparing.  Non-smooth at d2=0
+    (autograd yields a subgradient there).
     """
     x = knots_x
     h_left  = x[1:-1] - x[:-2]      # (K-2,)
@@ -83,10 +83,7 @@ def bg_penalty(rates, prior: PriorConfig) -> torch.Tensor:
     """Gamma prior on the background rates, from an independent calibration.
 
     A background measured by counting is Gamma-distributed *exactly*: ``N`` photons in a
-    blank window of length ``T`` give ``p(beta) ~ beta**N exp(-T beta)``.  So this is not
-    a distributional assumption layered on the calibration -- it IS the calibration's own
-    posterior.  (``logD_penalty`` above is a Gaussian instead, deliberately: a diffusion
-    coefficient is not a counted rate.)
+    blank window of length ``T`` give ``p(beta) ~ beta**N exp(-T beta)``.
 
     The fit optimises ``ln bg``, so the Gamma is written as a proper density in THAT
     coordinate (the Jacobian is kept).  With ``r = bg / mean`` and ``k = (mean / sd)**2``

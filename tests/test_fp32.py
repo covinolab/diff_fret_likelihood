@@ -5,7 +5,7 @@ in float64, and runs only the per-photon propagate/emit/normalize in float32.
 These are the accuracy GATES for the fp32 flag (the real speedup is on the GPU;
 the accuracy is device-independent so tested on CPU).  Value must match fp64 to
 ~1e-3 relative, and gradients must stay directionally identical (cosine > 0.999)
-so Adam MAP fitting is unaffected.  The end-to-end science gate is
+so gradient-based MAP fitting is unaffected.  The end-to-end science gate is
 ``tests/test_bartlett_fisher.py`` re-run under fp32 (separate, heavier).
 """
 
@@ -93,7 +93,7 @@ def test_fp32_holds_at_long_stream():
 
 def test_fp32_gradient_cosine():
     """fp32 gradients stay directionally identical to fp64 (cosine > 0.999),
-    so Adam MAP steps point the same way."""
+    so MAP optimisation steps point the same way."""
     grid, pot, C, rates, R0 = _setup()
     ipt, colors, mask = _batch()
 
@@ -133,7 +133,7 @@ def _fit_D(propagate_dtype):
         g[0] = 0.0
         ipt[b] = g
         colors[b] = torch.randint(0, 2, (n,))
-    optim = dfl.OptimConfig(adam_steps=40, adam_lr=0.05, propagate_dtype=propagate_dtype)
+    optim = dfl.OptimConfig(steps=40, propagate_dtype=propagate_dtype)
     res = dfl.fit(_Batch(ipt, colors, mask), grid, pot, C, consts.R0,
                   D_init=5.0, rates_init=rates, prior=dfl.PriorConfig(curvature_weight=0.05),
                   optim=optim, fit_D=True, fit_rates=False, verbose=False)
@@ -142,7 +142,7 @@ def _fit_D(propagate_dtype):
 
 def test_fp32_fit_recovers_same_as_fp64():
     """End-to-end: an fp32 MAP fit reaches the same D / loss as the fp64 fit on
-    identical data (Adam is robust to the ~1e-8 fp32 gradient noise)."""
+    identical data (the guarded LBFGS fit tolerates the ~1e-8 fp32 gradient noise)."""
     torch.manual_seed(0)
     D64, loss64 = _fit_D(None)
     torch.manual_seed(0)
