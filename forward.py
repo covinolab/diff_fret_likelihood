@@ -73,9 +73,9 @@ def _robust_eigh(A: torch.Tensor):
             lam, Q = torch.linalg.eigh(A_cpu)
             _warn_once("cpu", "eigh failed on CUDA (cuSOLVER); fell back to the "
                        "slower CPU LAPACK path. This is triggered by ill-conditioned "
-                       "generators (e.g. steep landscapes proposed during HMC). If it "
-                       "recurs, reduce step_size, tighten gp_sigma, or sample on CPU. "
-                       "(warned once)")
+                       "generators (e.g. the steep landscapes a sampler transiently "
+                       "proposes). If it recurs, tighten the landscape prior, reduce the "
+                       "sampler step size, or run on CPU. (warned once)")
             return lam.to(A.device), Q.to(A.device)
         except torch.linalg.LinAlgError:
             pass
@@ -88,8 +88,8 @@ def _robust_eigh(A: torch.Tensor):
             _warn_once("jitter", "eigh needed escalating jitter (up to "
                        f"{jit:.1e}) to decompose an ill-conditioned generator; the "
                        "landscape at this parameter is very steep -- results here are "
-                       "approximate. Consider a tighter gp_sigma / smaller step_size. "
-                       "(warned once)")
+                       "approximate. Consider a tighter landscape prior or a smaller "
+                       "sampler step size. (warned once)")
             return lam.to(A.device), Q.to(A.device)
         except torch.linalg.LinAlgError as err:
             last_err = err

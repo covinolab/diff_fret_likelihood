@@ -129,21 +129,20 @@ class PriorConfig:
     than transplanting one.  Grid-independent by construction -- it never touches the
     fine grid, only the knots that carry the degrees of freedom.
 
-    GP prior (``gp_*``): a PROPER stationary-kernel Gaussian-process prior over the
-    landscape ``U(x)`` (see ``objective.gp_penalty``).  Where ``curvature_penalty`` is
-    the *improper* thin-plate limit (only roughness; constant+linear unpenalised), the
-    GP prior adds a finite amplitude ``gp_sigma`` (kT) and correlation length
-    ``gp_lengthscale`` (nm), making the landscape posterior proper -- essential for
-    HMC sampling (see ``sample.py``).  ``gp_sigma=None`` disables it (default), so the
-    objective is byte-for-byte unchanged unless the GP is explicitly switched on.
-    Recommendation: use the GP as the SINGLE shape prior (``curvature_weight=0``);
-    don't stack two strong smoothness priors.
+    Two terms, and only two: the curvature roughness above and the background Gamma
+    prior below.  Each is toggled by a sentinel (weight ``0`` or ``None``).
+    ``PriorConfig()`` is prior-free by default (``curvature_weight=0.0``, both terms
+    off) -- equivalent to pure MLE; switch on the terms you want, or pass ``prior=None``
+    to ``fit`` / ``neg_log_posterior`` (or use ``PriorConfig.none()`` when an instance is
+    required) for an explicit MLE.  ``active_terms()`` / ``describe()`` report which
+    terms are on.
 
-    Each term is toggled by a sentinel (weight ``0`` or ``None``).  ``PriorConfig()``
-    is prior-free by default (``curvature_weight=0.0``, all terms off) -- equivalent to
-    pure MLE; switch on the terms you want, or pass ``prior=None`` to ``fit`` /
-    ``neg_log_posterior`` (or use ``PriorConfig.none()`` when an instance is required)
-    for an explicit MLE.  ``active_terms()`` / ``describe()`` report which terms are on.
+    Note the curvature prior is the *improper* thin-plate limit: it penalises roughness
+    only, leaving the constant and linear directions of ``U`` unpenalised.  The constant
+    is pure gauge and is handled separately (``objective.gauge_penalty``), but nothing
+    here makes the landscape posterior proper.  A GP prior that did was removed in 0.3.0
+    along with the ``logD`` prior and ``l2_weight`` -- none had ever been switched on in
+    an analysis; see CHANGELOG.md.
     """
 
     # --- landscape roughness (improper thin-plate; scaled by this weight) ---
@@ -153,9 +152,6 @@ class PriorConfig:
     # intermediates) while suppressing many small wiggles. SplinePotential only.
     # The two norms live on DIFFERENT scales -- curvature_weight does not carry over.
     curvature_norm: str = "l2"
-    # --- weak Gaussian prior on log D (logD_mean=None -> off) ---
-    logD_mean: float | None = None
-    logD_std: float = 1.0
     # --- Gamma prior on the backgrounds, from an independent calibration ---
     # Everything in kHz, the same units as the rates themselves: `bg_c_mean` is what a
     # blank / donor-only window measures and `bg_c_sd` is that measurement's error bar.
@@ -163,28 +159,17 @@ class PriorConfig:
     # then REQUIRES its sd -- a mean without an error bar is not a measurement.
     # Per channel, not shared, because a calibration reports one error bar per detector;
     # set them equal if yours does not distinguish.  See objective.bg_penalty for the
-    # form, and why this is a Gamma while logD above is a Gaussian.
+    # form, and why a counted background is a Gamma rather than a Gaussian.
     bg_g_mean: float | None = None
     bg_g_sd: float | None = None
     bg_r_mean: float | None = None
     bg_r_sd: float | None = None
-    # --- optional weak L2 on potential params (0 -> off) ---
-    l2_weight: float = 0.0
-    # --- proper GP prior over U(x) (None sigma -> OFF; fully backward-compatible) ---
-    gp_sigma: float | None = None      # marginal SD (kT); None DISABLES the GP prior
-    gp_lengthscale: float = 1.0        # correlation length (nm)
-    gp_kernel: str = "matern52"        # "rbf" | "matern32" | "matern52"
-    gp_n_ctrl: int = 16                # control points; clamped to [4, n_grid]
-    gp_mean: "torch.Tensor | None" = None  # [G] on the grid; interp'd to x_ctrl; None -> 0
-    gp_jitter: float = 1e-6            # relative to the correlation matrix (FIXED)
 
     def __post_init__(self):
         if self.curvature_weight < 0:
             raise ValueError(
                 f"curvature_weight must be >= 0, got {self.curvature_weight}"
             )
-        if self.logD_std <= 0:
-            raise ValueError(f"logD_std must be > 0, got {self.logD_std}")
         for _c in ("g", "r"):
             _m = getattr(self, f"bg_{_c}_mean")
             _s = getattr(self, f"bg_{_c}_sd")
@@ -200,19 +185,6 @@ class PriorConfig:
                 )
             if _s <= 0:
                 raise ValueError(f"bg_{_c}_sd is a rate in kHz and must be > 0, got {_s}")
-        if self.l2_weight < 0:
-            raise ValueError(f"l2_weight must be >= 0, got {self.l2_weight}")
-        if self.gp_sigma is not None:
-            if self.gp_sigma <= 0:
-                raise ValueError(f"gp_sigma must be > 0, got {self.gp_sigma}")
-            if self.gp_lengthscale <= 0:
-                raise ValueError(
-                    f"gp_lengthscale must be > 0, got {self.gp_lengthscale}"
-                )
-            if self.gp_kernel not in ("rbf", "matern32", "matern52"):
-                raise ValueError(
-                    f"gp_kernel must be rbf|matern32|matern52, got {self.gp_kernel!r}"
-                )
 
     @classmethod
     def none(cls) -> "PriorConfig":
@@ -229,14 +201,8 @@ class PriorConfig:
         terms: list[str] = []
         if self.curvature_weight:
             terms.append("curvature")
-        if self.logD_mean is not None:
-            terms.append("logD")
         if self.bg_g_mean is not None or self.bg_r_mean is not None:
             terms.append("bg")
-        if self.gp_sigma is not None:
-            terms.append("gp")
-        if self.l2_weight:
-            terms.append("l2")
         return terms
 
     def describe(self) -> str:

@@ -1,7 +1,6 @@
 """``prior=None`` -> true MLE, the isolated ``prior_penalty`` term, config cleanup.
 
-Simulator-independent: tiny synthetic potentials / photon streams built here
-(same style as ``test_gp_prior.py``).
+Simulator-independent: tiny synthetic potentials / photon streams built here.
 """
 
 import pytest
@@ -103,7 +102,7 @@ def test_prior_penalty_zero_for_none_and_all_off():
 def test_neg_log_posterior_is_ll_plus_prior_penalty():
     """The objective decomposes exactly as -ll + prior_penalty for a real prior."""
     grid, pot, consts, C, rates, D, ipt, colors, mask = _setup()
-    prior = dfl.PriorConfig(curvature_weight=0.05, gp_sigma=2.0)
+    prior = dfl.PriorConfig(curvature_weight=0.05)
 
     ll = marginal_loglik_batch(ipt, colors, mask, pot, D, rates, grid, C, consts.R0)
     reg = prior_penalty(pot, D, grid, prior)
@@ -148,19 +147,49 @@ def test_none_and_active_terms():
     default = dfl.PriorConfig()  # prior-free by default (curvature_weight=0.0)
     assert default.active_terms() == []
 
-    full = dfl.PriorConfig(curvature_weight=0.05, logD_mean=0.0,
-                           gp_sigma=2.0, l2_weight=1e-3)
-    assert full.active_terms() == ["curvature", "logD", "gp", "l2"]
+    full = dfl.PriorConfig(curvature_weight=0.05, bg_g_mean=1.6, bg_g_sd=0.16)
+    assert full.active_terms() == ["curvature", "bg"]
     assert "MAP prior:" in full.describe()
+
+
+def test_active_terms_matches_what_the_objective_charges():
+    """Every term ``active_terms()`` reports must actually cost something.
+
+    Generalised from the old ``test_logD_prior`` version, and kept for the reason that
+    test existed: ``logD_penalty`` was once defined but never called, so every
+    ``logD_mean`` in every config was a silent no-op while ``active_terms()`` cheerfully
+    reported "logD".  A term that is advertised but not charged is the failure mode this
+    guards, so it loops over the terms rather than naming one.
+    """
+    grid = _grid()
+    pot = _spline(grid, [0.4, -0.7, 0.3, 0.9, -0.2])
+    D = torch.tensor(0.6, dtype=torch.float64)
+    rates = dfl.EffectiveRates(*[torch.tensor(v, dtype=torch.float64)
+                                 for v in (24.0, 24.0, 1.6, 4.0)])
+
+    cases = {
+        "curvature": dfl.PriorConfig(curvature_weight=0.05),
+        "bg": dfl.PriorConfig(bg_g_mean=1.0, bg_g_sd=0.1,
+                              bg_r_mean=2.0, bg_r_sd=0.2),
+    }
+    # every term the config can switch on is covered here, so a newly added term that
+    # nothing charges for will show up as a missing key rather than a silent pass.
+    assert set(cases) == set(dfl.PriorConfig(
+        curvature_weight=0.05, bg_g_mean=1.0, bg_g_sd=0.1).active_terms())
+
+    for name, prior in cases.items():
+        assert prior.active_terms() == [name], name
+        charged = float(prior_penalty(pot, D, grid, prior, rates=rates))
+        assert charged > 0.0, f"{name} is advertised by active_terms() but costs nothing"
 
 
 def test_weight_validation():
     with pytest.raises(ValueError):
         dfl.PriorConfig(curvature_weight=-1.0)
+    with pytest.raises(ValueError):          # a bg mean without its error bar
+        dfl.PriorConfig(bg_g_mean=1.6)
     with pytest.raises(ValueError):
-        dfl.PriorConfig(logD_std=0.0)
-    with pytest.raises(ValueError):
-        dfl.PriorConfig(l2_weight=-1e-3)
+        dfl.PriorConfig(bg_g_mean=-1.0, bg_g_sd=0.1)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +200,6 @@ def test_sampler_rejects_prior_none():
     batch = _Batch(ipt, colors, mask)
     with pytest.raises(ValueError):
         build_log_prob(batch, grid, pot, C, consts.R0, None, rates, D_init=10.0)
-    # and the existing guard: a real config still needs a proper (gp) prior
-    with pytest.raises(ValueError):
-        build_log_prob(batch, grid, pot, C, consts.R0,
-                       dfl.PriorConfig(curvature_weight=0.05), rates, D_init=10.0)
+    # NOTE: this file once also asserted the sampler's "needs a proper GP prior" guard.
+    # That guard is gone with the GP prior (dfl 0.3.0) and sample.py is being rewritten,
+    # so only the prior=None rejection -- which is independent of it -- is checked here.

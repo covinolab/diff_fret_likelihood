@@ -4,10 +4,11 @@
 rates -- encode an independent background calibration.  Two things are tested here and neither is cosmetic:
 
 * the term reaches ``prior_penalty`` -- the single place the prior enters the objective.
-  ``logD`` was silently dropped once (see ``test_logD_prior.py``), so ``prior_penalty``
-  RAISES when a bg prior is configured but ``rates`` is not supplied, and that is tested.
+  The ``logD`` prior was silently dropped once (it was defined but never called, and was
+  removed entirely in 0.3.0), so ``prior_penalty`` RAISES when a bg prior is configured
+  but ``rates`` is not supplied, and that is tested.
 * it really is a Gamma, not a Gaussian on ``ln bg``.  The two agree to second order, so a
-  copy-paste of ``logD_penalty`` would pass every test except the skew one below.
+  Gaussian copy-paste would pass every test except the skew one below.
 
 Why it matters: background and landscape width are one parameter, not two (the likelihood
 pins their product ~15x tighter than either factor), so a calibrated background is what
@@ -75,8 +76,8 @@ def test_it_is_a_gamma_not_a_gaussian_in_log_bg():
     """Asymmetric in log: too-LARGE a background costs more than too-small.
 
     A Gaussian on ln bg is exactly symmetric under bg -> mean**2/bg, so this asymmetry is
-    the one property that separates the two -- a copy-paste of ``logD_penalty`` passes
-    every other test in this file.
+    the one property that separates the two -- a Gaussian copy-paste passes every other
+    test in this file.
 
     The sign is the Gamma's, and it is the physically right one: with ``k`` counts behind
     the calibration, ``k(r - ln r - 1)`` has an exponential right tail (``r``) and only a
@@ -132,10 +133,14 @@ def test_channels_gate_independently_and_are_reported():
 
 
 def test_no_bg_prior_leaves_the_objective_untouched():
-    """A PriorConfig without bg means must be byte-identical to before this feature."""
+    """A PriorConfig without bg means must be byte-identical to before this feature.
+
+    The prior carries a NON-bg term (curvature) so the comparison is not trivially
+    0 == 0: passing `rates` must leave a configured-but-bg-free prior untouched.
+    """
     grid, pot = _grid(), _spline(_grid())
     D = torch.tensor(1.5, dtype=torch.float64)
-    p = _prior(logD_mean=math.log(1.5), logD_std=0.5)
+    p = _prior(curvature_weight=0.05)
     assert (float(prior_penalty(pot, D, grid, p))
             == float(prior_penalty(pot, D, grid, p, rates=_rates())))
 

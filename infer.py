@@ -264,10 +264,10 @@ def fit_multi(
         loss = - sum_d loglik_d(U, D, rates_d ; R0_d, C_d)  +  prior(U, D)  +  gauge(U)
 
     with the prior and gauge anchor added exactly ONCE on the shared ``(U, D)`` (looping
-    ``neg_log_posterior`` per dataset would triple-count the smoothness / ``logD``
-    priors).  The datasets *cannot* be pooled into one padded batch: each ``(kD, R0)``
-    builds a different propagator, so it is one ``marginal_loglik_batch`` call per
-    dataset, summed.
+    ``neg_log_posterior`` per dataset would triple-count the smoothness prior).  The
+    datasets *cannot* be pooled into one padded batch: each ``(kD, R0)`` builds a
+    different propagator, so it is one ``marginal_loglik_batch`` call per dataset,
+    summed.
 
     Interface mirrors :func:`fit` -- ``batch``/``C``/``R0``/``rates_init`` are simply
     pluralised into equal-length lists; everything shared (``grid``, ``potential``,
@@ -326,8 +326,8 @@ def fit_multi(
                 propagate_dtype=optim.propagate_dtype,
             )
             ll = ll_i if ll is None else ll + ll_i
-        # The shared priors (curvature / logD / GP / l2) are applied ONCE -- see the
-        # note above about not triple-counting them.  The background prior is NOT
+        # The shared prior (curvature) is applied ONCE -- see the note above about
+        # not triple-counting it.  The background prior is NOT
         # shared: every dataset carries its own bg_g/bg_r, so it gets its own term.
         reg = prior_penalty(potential, D, grid, prior)
         if prior is not None and (prior.bg_g_mean is not None

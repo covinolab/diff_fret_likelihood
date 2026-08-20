@@ -1,13 +1,14 @@
 """Objectives, priors and regularisers.
 
-* ``curvature_penalty`` -- discrete-curvature smoothness prior on ``u`` (SPEC 9).
+* ``curvature_penalty_spline`` -- roughness prior on the knot heights (SPEC 9).
+* ``bg_penalty`` -- Gamma prior on the backgrounds, from an independent calibration.
 * ``prior_penalty`` -- the single aggregated ``-log prior`` term (``None`` -> MLE).
 * ``neg_log_posterior`` -- marginal-likelihood-based training objective.
+* ``gauge_*`` -- the anchor on the pure-gauge offset of ``U`` (not a prior; a choice
+  of coordinates, added by ``infer.fit`` rather than by ``prior_penalty``).
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 
@@ -53,13 +54,6 @@ def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor,
     return (d2 ** 2).sum()
 
 
-def logD_penalty(D: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
-    if prior.logD_mean is None:
-        return _scalar_zero(D)
-    logD = torch.log(D)
-    return 0.5 * ((logD - prior.logD_mean) / prior.logD_std) ** 2
-
-
 def bg_penalty(rates, prior: PriorConfig) -> torch.Tensor:
     """Gamma prior on the background rates, from an independent calibration.
 
@@ -97,77 +91,6 @@ def bg_penalty(rates, prior: PriorConfig) -> torch.Tensor:
         term = k * (r - torch.log(r) - 1.0)
         out = term if out is None else out + term
     return _scalar_zero(rates.bg_g) if out is None else out
-
-
-def _gp_corr(x_ctrl: torch.Tensor, lengthscale: float, kernel: str) -> torch.Tensor:
-    """Stationary correlation matrix ``[n,n]`` on control points (unit variance)."""
-    r = (x_ctrl[:, None] - x_ctrl[None, :]).abs() / lengthscale
-    if kernel == "rbf":
-        return torch.exp(-0.5 * r ** 2)
-    if kernel == "matern32":
-        c = math.sqrt(3.0)
-        return (1.0 + c * r) * torch.exp(-c * r)
-    if kernel == "matern52":
-        c = math.sqrt(5.0)
-        return (1.0 + c * r + (5.0 / 3.0) * r ** 2) * torch.exp(-c * r)
-    raise ValueError(f"unknown gp_kernel {kernel!r}")
-
-
-def _interp(x_src: torch.Tensor, y_src: torch.Tensor, x_query: torch.Tensor) -> torch.Tensor:
-    """Linear interpolation of ``y_src`` (on ascending ``x_src``) at ``x_query``.
-
-    Used only for the fixed GP prior mean, so ``y_src`` is detached (no grad).
-    """
-    x_src = x_src.detach()
-    y_src = y_src.detach().to(dtype=x_query.dtype, device=x_query.device)
-    n = x_src.shape[0]
-    idx = torch.searchsorted(x_src, x_query).clamp(1, n - 1)
-    x0, x1 = x_src[idx - 1], x_src[idx]
-    y0, y1 = y_src[idx - 1], y_src[idx]
-    denom = (x1 - x0).clamp_min(torch.finfo(x_query.dtype).tiny)
-    return y0 + (x_query - x0) / denom * (y1 - y0)
-
-
-def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tensor:
-    """``-log`` of a proper GP prior over ``U(x)`` (up to a fixed constant).
-
-    Evaluated on ``gp_n_ctrl`` control points (well-conditioned, unlike the full
-    fine grid); the residual is MEAN-CENTERED so the prior is gauge-invariant
-    (matches the constant-shift invariance of the likelihood / curvature term)
-    and shrinks well-depths/barrier-heights symmetrically with SD ``gp_sigma``.
-    Acts as a proper prior on ``theta``.
-
-    Note: the constant ``0.5 logdet(2 pi K)`` is dropped -- valid because the GP
-    hyperparameters are FIXED during a fit/chain, so it shifts the loss by a
-    constant (raw loss values are therefore not comparable across GP settings).
-    """
-    if prior.gp_sigma is None:
-        return _scalar_zero(grid)
-    n = int(min(max(prior.gp_n_ctrl, 4), grid.shape[0]))
-    x_ctrl = torch.linspace(
-        float(grid.min()), float(grid.max()), n, dtype=grid.dtype, device=grid.device
-    )
-    u_ctrl = potential(x_ctrl)  # raw; grads flow to theta / net params
-    if prior.gp_mean is not None:
-        u_ctrl = u_ctrl - _interp(grid, prior.gp_mean, x_ctrl)
-    r = u_ctrl - u_ctrl.mean()  # gauge-invariant (mean-centered, smooth)
-
-    Kc = _gp_corr(x_ctrl, prior.gp_lengthscale, prior.gp_kernel)
-    eye = torch.eye(n, dtype=grid.dtype, device=grid.device)
-    # Fixed jitter; deterministic escalation only if Cholesky fails (inputs are
-    # constant within a fit, so the landed jitter is stationary across calls).
-    jit = float(prior.gp_jitter)
-    for _ in range(6):
-        try:
-            L = torch.linalg.cholesky(Kc + jit * eye)
-            break
-        except RuntimeError:
-            jit *= 10.0
-    else:  # pragma: no cover - pathological kernel
-        raise RuntimeError("GP kernel Cholesky failed even after jitter escalation")
-
-    z = torch.linalg.solve_triangular(L, r.unsqueeze(-1), upper=False)
-    return 0.5 * (z ** 2).sum() / (prior.gp_sigma ** 2)
 
 
 def gauge_offset_from_theta(theta: torch.Tensor) -> torch.Tensor:
@@ -223,10 +146,14 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
     is just ``-loglik + prior_penalty(...)``.  ``prior=None`` means a **pure MLE**
     fit -- no regularisation at all -- and returns exactly ``0``.
 
+    ``D`` is currently unused: its only consumer was the ``logD`` prior, removed in
+    0.3.0.  The parameter stays because ``fisher._PriorModule`` and ``infer.fit_multi``
+    pass it positionally, and because a prior on ``D`` is the obvious thing to add back
+    here if one is ever wanted.
+
     A ``None`` prior is numerically identical to a ``PriorConfig`` with every term
-    off (``curvature_weight=0``, ``logD_mean=None``, ``gp_sigma=None``,
-    ``l2_weight=0``), but skips the (zero-weighted) curvature evaluation, so it is
-    both cleaner and slightly cheaper.
+    off (``curvature_weight=0`` and no ``bg_*_mean``), but skips the (zero-weighted)
+    curvature evaluation, so it is both cleaner and slightly cheaper.
     """
     if prior is None:
         return _scalar_zero(grid)
@@ -237,13 +164,11 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
             potential.theta, potential.knots_x,
             norm=getattr(prior, "curvature_norm", "l2"),
         )
-    if prior.logD_mean is not None:
-        reg = reg + logD_penalty(D, prior)
     if prior.bg_g_mean is not None or prior.bg_r_mean is not None:
-        # Fail loudly rather than silently skipping: the logD prior was dead for weeks
-        # because a term could go missing without anything complaining (see
-        # tests/test_logD_prior.py).  A caller that configures a bg prior but cannot
-        # supply the rates is asking for something this function cannot deliver.
+        # Fail loudly rather than silently skipping.  The precedent: the logD prior
+        # (removed in 0.3.0) sat dead for weeks because a term could go missing without
+        # anything complaining.  A caller that configures a bg prior but cannot supply
+        # the rates is asking for something this function cannot deliver.
         if rates is None:
             raise ValueError(
                 "prior_penalty: a background prior is configured (bg_g_mean/bg_r_mean) "
@@ -251,11 +176,6 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
                 "prior_penalty(..., rates=rates), or clear the bg means."
             )
         reg = reg + bg_penalty(rates, prior)
-    if prior.gp_sigma is not None:
-        reg = reg + gp_penalty(potential, grid, prior)
-    if prior.l2_weight:
-        pnorm = sum((p ** 2).sum() for p in potential.parameters())
-        reg = reg + prior.l2_weight * pnorm
     return reg
 
 
@@ -266,9 +186,10 @@ def neg_log_posterior(
     """``-loglik + prior_penalty`` (marginal-based).  Scalar tensor.
 
     With ``prior=None`` this is the pure negative log-likelihood, i.e. a true MLE
-    objective (see ``prior_penalty``).  Otherwise the curvature and ``logD`` priors
-    act on ``u_grid``/``D`` only.  ``compile_mode`` / ``propagate_dtype`` are
-    forwarded to ``marginal_loglik_batch`` (defaults -> eager float64).
+    objective (see ``prior_penalty``).  Otherwise the curvature prior acts on the knot
+    heights and the background prior on ``rates``.  ``compile_mode`` /
+    ``propagate_dtype`` are forwarded to ``marginal_loglik_batch`` (defaults -> eager
+    float64).
     """
     ll = marginal_loglik_batch(
         ipt, colors, mask, potential, D, rates, grid, C, R0, p0=p0,

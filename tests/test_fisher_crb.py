@@ -238,8 +238,15 @@ def test_fisher_additive_over_traces(crb_setup):
 # prior inclusion: cov becomes the posterior covariance (Fisher + prior Hessian)
 # --------------------------------------------------------------------------- #
 def _post(s, **kw):
-    """The posterior CRB: same call as ``_crb`` plus a mean-centred GP landscape prior."""
-    prior = dfl.PriorConfig(curvature_weight=0.0, gp_sigma=2.0, gp_lengthscale=1.0)
+    """The posterior CRB: same call as ``_crb`` plus the landscape prior a fit uses.
+
+    Was a mean-centred GP prior until 0.3.0; now the curvature prior, which is what
+    every real fit runs with (see diff_fret_analysis/scripts/configs/*.yaml).  Note the
+    curvature prior is IMPROPER -- it penalises roughness and leaves the constant and
+    linear directions free -- so unlike the GP it does not by itself guarantee that
+    every knot direction is pinned; that is checked, not assumed, below.
+    """
+    prior = dfl.PriorConfig(curvature_weight=0.05)
     return dfl.cramer_rao_bound(s["batch"], s["grid"], s["pot"], s["D"], s["rates"],
                                 s["C"], s["R0"], prior=prior, **kw)
 

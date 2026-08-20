@@ -53,7 +53,10 @@ does nothing for them — ``F_N + H_gauge`` can still be singular, in which case
 Cholesky refuses, the floored SVD takes over and ``null_dim`` reports how many
 directions had to be floored (``0`` = an exact inverse, the normal case).  A σ in a
 floored direction is a *lower bound*; inspect the Fisher diagonal to see which knots
-are informed, and add a landscape prior if you need a finite bound on every knot.
+are informed.  Note the curvature prior cannot fix this on its own: it is the improper
+thin-plate limit, so it constrains roughness but leaves the flat directions free.  The
+practical remedy is to narrow ``grid`` to the region the data actually inform (the
+published fits reach ``null_dim = 0`` that way).
 
 Caveats:
   * The bound is evaluated at the supplied ground-truth ``φ`` in the estimator's
@@ -322,7 +325,8 @@ def _psd_inverse(M, rtol):
     reported σ too small, i.e. over-confident, and nothing in the returned values says so
     beyond ``n_floored``.  Cholesky removes the assumption: it either inverts exactly or
     refuses, and the factorisation succeeding is itself the proof that every direction is
-    pinned (by prior, gauge anchor and data together -- the prior alone does not do it).
+    pinned (by curvature prior, gauge anchor and data together -- no one of them does it
+    alone).
     """
     M = 0.5 * (M + M.T)
     try:
@@ -356,7 +360,7 @@ def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
     * the **gauge anchor** (``gauge_sd``) is a choice of coordinates, so it is included
       whenever ``gauge_sd is not None`` — *regardless of* ``prior``.  It is what makes
       the information matrix invertible at all.
-    * the **``PriorConfig`` prior** (curvature / GP / l2 / logD / bg, via
+    * the **``PriorConfig`` prior** (curvature and bg, via
       ``objective.prior_penalty``) and the **Gaussian rate prior** (``rate_sd``) are
       beliefs about physics, so they opt in together with ``prior``; ``rate_sd`` is
       ignored when ``prior is None``.
@@ -437,10 +441,9 @@ def cramer_rao_bound(
     landscape functionals are untouched — the module docstring gives the exact identity.
 
     With ``prior=None`` (default) this is therefore the likelihood CRB in the anchored
-    gauge.  With a ``prior`` (a ``PriorConfig`` with ``gp_sigma`` set, as for the sampler)
-    the prior's Hessian and the Gaussian rate prior are added as well, giving the
-    **posterior information matrix** — the analytic Laplace precision the ``sample``
-    module expands around, matching ``sample.build_log_prob`` exactly.
+    gauge.  With a ``prior`` (the ``PriorConfig`` the fit used) the prior's Hessian and
+    the Gaussian rate prior are added as well, giving the **posterior information
+    matrix** — the analytic Laplace precision of that MAP objective.
     ``cov``/``sigma`` are then the posterior covariance/σ, with the prior additionally
     regularising the soft edge-knot directions the anchor cannot reach.  Evaluate at a
     MAP (``dfl.fit`` output) for the Laplace interpretation; at the truth it is the
@@ -464,9 +467,10 @@ def cramer_rao_bound(
         Fixed crosstalk / Förster radius (as in ``fit`` / ``marginal_loglik_batch``).
     prior : PriorConfig | None
         If given, include the prior's Hessian so ``cov`` is the posterior covariance
-        (Laplace precision) rather than the likelihood CRB.  A proper landscape prior
-        (``gp_sigma`` set) is what gives a finite bound on knots the data never see;
-        the gauge itself is handled by ``gauge_sd`` independently of this.
+        (Laplace precision) rather than the likelihood CRB.  Pass the SAME
+        ``PriorConfig`` the fit used, or the bound describes a different objective than
+        the one that produced the MAP.  The gauge is handled by ``gauge_sd``
+        independently of this.
     gauge_sd : float | None
         Std of the Gaussian gauge anchor on ``mean(theta)``, added ALWAYS — not gated on
         ``prior``.  Match the value used in the fit / sampler (both default to ``1.0``).

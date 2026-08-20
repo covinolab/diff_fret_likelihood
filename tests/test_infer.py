@@ -88,8 +88,7 @@ def test_best_loss_matches_objective_at_returned_state():
     cols = torch.randint(0, 2, (n,))
     batch = _OneTraceBatch(gaps, cols, n)
 
-    prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
-                            logD_mean=math.log(10.0), logD_std=0.5)
+    prior = dfl.PriorConfig(curvature_weight=0.1)
     optim = dfl.OptimConfig(steps=20, lbfgs_lr=3.0, log_every=1)
     pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
@@ -140,8 +139,7 @@ def test_guard_recovers_and_plateau_stops():
     gaps[0] = 0.0
     cols = torch.randint(0, 2, (n,))
     batch = _OneTraceBatch(gaps, cols, n)
-    prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
-                            logD_mean=math.log(10.0), logD_std=0.5)
+    prior = dfl.PriorConfig(curvature_weight=0.1)
 
     def fresh_pot():
         pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
@@ -185,10 +183,9 @@ def test_fit_enforces_mean_theta_zero_and_preserves_identified():
     cols = torch.randint(0, 2, (n,))
     batch = _OneTraceBatch(gaps, cols, n)
 
-    # proper prior on the shape + a logD prior so D stays identified (avoids the
-    # D-valley blow-up on tiny data); none of these terms constrain the offset.
-    prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
-                            logD_mean=math.log(10.0), logD_std=0.5)
+    # a shape prior on the knots; it does not constrain the pure-gauge offset, which is
+    # exactly what makes it a valid control for the anchor test.
+    prior = dfl.PriorConfig(curvature_weight=0.1)
     # tight stop_min_delta: the gauge term is tiny in nats, so the default 0.1-nat
     # plateau threshold would stop the fit before mean(theta) is pinned to < 5e-3.
     optim = dfl.OptimConfig(steps=600, stop_min_delta=1e-3, log_every=200)
