@@ -28,8 +28,13 @@ jobs:
 
       # torch is a documented prerequisite (installed separately from the package
       # deps); use the CPU wheel index so no CUDA is pulled on the runner.
+      # The upper bound is deliberate. Unpinned, this line rolls onto every new torch
+      # release, and the fit's numerics move with the LAPACK build underneath it: a
+      # release once turned test_infer's marginal eigendecompositions non-finite one
+      # LBFGS step earlier and reddened CI with no code change on our side. Raise the
+      # bound when you have run the suite against the newer torch, not before.
       - name: Install PyTorch (CPU)
-        run: pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+        run: pip install "torch>=2.1,<2.14" --index-url https://download.pytorch.org/whl/cpu
 
       # Non-editable, so this doubles as the packaging smoke test: it proves the
       # wheel builds and that `pip install diff_fret_likelihood` works for a user.

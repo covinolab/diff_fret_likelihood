@@ -313,15 +313,11 @@ def _warm_start(batch, grid, potential, C, R0, prior, rates_init, *, physics,
 # --------------------------------------------------------------------------- #
 def sample_posterior(
     batch, grid, potential, C, R0, prior: PriorConfig | None, rates_init=None, *,
-    # warm start
     physics=None, kde_warmstart=True, kde_bin_ms=None, kde_kwargs=None,
     map_warmstart=True, map_optim=None, fit_rates=True, fit_bg=True, D_init=None,
-    # sampler
     sampler="nuts", num_samples=1000, warmup=200, step_size=0.01, target_accept=0.8,
     full_mass=True, max_tree_depth=10, num_steps_per_sample=20, seed=0, init_jitter=0.0,
-    # objective
     gauge_sd=1.0, p0=None,
-    # performance
     compile_mode=None, propagate_dtype=None, jit_compile=False, verbose=True,
 ) -> PosteriorSamples:
     """Draw from the posterior over U(x), D and the emission rates with pyro HMC/NUTS.
