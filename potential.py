@@ -1,16 +1,16 @@
-"""Neural / spline potential ``u_theta(x)`` in units of k_B T.
+"""Spline potential ``u_theta(x)`` in units of k_B T.
 
 The marginal likelihood only needs ``u`` on the grid (the detailed-balance
 generator is built from potential *differences*).  The force ``-du/dx`` is
-provided via autograd for the secondary joint objective (SPEC section 7.1).
+provided analytically for the secondary joint objective (SPEC section 7.1).
 
-Two interchangeable parameterisations behind one interface:
-
-* ``MLPPotential`` -- smooth-activation MLP (SPEC primary).  Smooth => C^inf
-  force; never ReLU.
-* ``SplinePotential`` -- natural-cubic potential-knot spline, linear in the
-  free knot heights.  Low-dimensional and very stable; used to cross-check the
-  MLP and as a robust fallback.
+One parameterisation: ``SplinePotential`` -- a natural-cubic potential-knot spline,
+linear in the free knot heights.  That linearity is load-bearing well beyond the fit
+being low-dimensional and stable: ``fisher.cramer_rao_bound`` scores the knot heights
+as a dense parameter vector, and the gauge machinery below identifies the exact flat
+direction with ``mean(theta)`` precisely because ``u = M_val @ theta`` with ``M_val``
+a partition of unity.  (An MLP parameterisation lived here until 0.2.0; it had neither
+property, no analysis used it, and it is gone.)
 
 The additive constant of ``u`` is pure gauge and must not change any observable
 (``tests/test_potential.py``).  Three distinct mechanisms exploit that, and they
@@ -34,62 +34,8 @@ from torch import nn
 
 from .config import DTYPE, PotentialConfig
 
-_ACTIVATIONS = {
-    "silu": nn.SiLU,
-    "gelu": nn.GELU,
-    "tanh": nn.Tanh,
-    "softplus": nn.Softplus,
-}
 
-
-class _BasePotential(nn.Module):
-    """Common force / on-grid machinery."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-        raise NotImplementedError
-
-    def force(self, x: torch.Tensor) -> torch.Tensor:
-        """Return ``-du/dx`` via autograd (create_graph=True for 2nd-order).
-
-        If ``x`` already requires grad, differentiate through it directly (so
-        the force is itself differentiable w.r.t. ``x``); otherwise make a
-        grad-enabled copy.  Either way the potential parameters stay tracked.
-        """
-        x_in = x if x.requires_grad else x.detach().requires_grad_(True)
-        u = self.forward(x_in)
-        (grad,) = torch.autograd.grad(u.sum(), x_in, create_graph=True)
-        return -grad
-
-    def on_grid(self, grid: torch.Tensor) -> torch.Tensor:
-        return self.forward(grid)
-
-
-class MLPPotential(_BasePotential):
-    """MLP ``u_theta`` with a smooth activation (SPEC primary)."""
-
-    def __init__(self, cfg: PotentialConfig):
-        super().__init__()
-        if cfg.x_center is None or cfg.x_scale is None:
-            raise ValueError("MLPPotential needs x_center and x_scale set "
-                             "(call PotentialConfig with grid extent).")
-        self.x_center = float(cfg.x_center)
-        self.x_scale = float(cfg.x_scale)
-        act = _ACTIVATIONS[cfg.activation]
-        dims = [1, *cfg.hidden, 1]
-        layers: list[nn.Module] = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(act())
-        self.net = nn.Sequential(*layers).to(DTYPE)
-
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xn = (x - self.x_center) / self.x_scale
-        return self.net(xn.unsqueeze(-1)).squeeze(-1)
-
-
-class SplinePotential(_BasePotential):
+class SplinePotential(nn.Module):
     """Natural-cubic potential spline; free params are knot *heights*.
 
     ``u(grid) = M_val @ theta`` is linear in ``theta`` (fast, stable).  Off-grid
@@ -138,31 +84,23 @@ class SplinePotential(_BasePotential):
     def force(self, x: torch.Tensor) -> torch.Tensor:
         """Analytic ``-du/dx = -(M_der @ theta)`` (differentiable in ``theta``).
 
-        Overrides the autograd-through-x base method, which cannot flow through
-        the NumPy-built basis.  Values are exact; the force is a function of
-        ``theta`` (not of ``x`` in the autograd sense), which is what the joint
-        objective's parameter gradients need.
+        The force is a function of ``theta`` (not of ``x`` in the autograd sense),
+        which is what the joint objective's parameter gradients need.  Autograd
+        through ``x`` is not an option here anyway: the basis is built in NumPy.
         """
         flat = x if x.dim() == 1 else x.reshape(-1)
         M_der = self._basis(flat, deriv=1)
         return -(M_der @ self.theta).reshape(x.shape)
 
 
-def build_potential(cfg: PotentialConfig, grid: torch.Tensor) -> _BasePotential:
-    """Factory: fill in the input-normalisation window from the grid extent."""
+def build_potential(cfg: PotentialConfig, grid: torch.Tensor) -> SplinePotential:
+    """Factory: fill in the knot window from the grid extent."""
     if cfg.x_center is None or cfg.x_scale is None:
         x_min = float(grid.min())
         x_max = float(grid.max())
         cfg = PotentialConfig(
-            kind=cfg.kind,
             x_center=0.5 * (x_min + x_max),
             x_scale=0.5 * (x_max - x_min),
-            hidden=cfg.hidden,
-            activation=cfg.activation,
             n_knots=cfg.n_knots,
         )
-    if cfg.kind == "mlp":
-        return MLPPotential(cfg)
-    if cfg.kind == "spline":
-        return SplinePotential(cfg, grid)
-    raise ValueError(f"unknown potential kind {cfg.kind!r}")
+    return SplinePotential(cfg, grid)

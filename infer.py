@@ -1,8 +1,8 @@
 """Gradient-based estimation of ``(theta, D, photophysics)`` (SPEC 7.6).
 
 Unconstrained parameterisation: optimise ``log D`` and (optionally)
-``log a_g, log a_r, log bg_g, log bg_r`` freely; map back with ``exp``.  The MLP
-potential parameters are optimised directly.  Optimiser: guarded LBFGS with NO
+``log a_g, log a_r, log bg_g, log bg_r`` freely; map back with ``exp``.  The spline
+knot heights are optimised directly.  Optimiser: guarded LBFGS with NO
 line search (strong-Wolfe returns a zero step on this objective and strands the
 fit ~8 nats short) -- one quasi-Newton step per outer iteration (``max_iter=1``;
 the curvature history persists across calls), so a non-finite guard with
@@ -366,7 +366,7 @@ def recovered_potential(potential, grid) -> torch.Tensor:
 
     The single reporting entry point: all downstream consumers (plots, RMSE harness,
     figure scripts) should call this so every landscape is in one convention.  This is
-    the grid-mean-zero gauge -- uniform for spline and MLP alike and robust to compare.
+    the grid-mean-zero gauge, which is robust to compare across fits.
     It differs from the fit/CRB enforcement gauge (``mean(theta)=0``) only by a
     constant.  (The min-subtraction in ``_BasePotential_on_grid`` is an *internal*
     exp-overflow safeguard for the likelihood, deliberately not used for reporting.)

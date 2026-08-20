@@ -4,4 +4,4 @@ Read at build time by ``pyproject.toml`` (``[tool.setuptools.dynamic]``) and at
 runtime via ``diff_fret_likelihood.__version__``.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

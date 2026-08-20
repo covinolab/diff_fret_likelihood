@@ -4,10 +4,9 @@ The marginal objective ``-log p`` is non-convex in the landscape parameters, so 
 good starting point matters.  Everything here is pure, used *before* ``fit``, and
 changes nothing in the fit path itself:
 
-* ``warmstart_potential`` -- set a potential so ``potential.on_grid(grid) ~= u_target``
-  for an externally supplied ``[G]`` profile.  Exact (least squares) for a
-  ``SplinePotential``, which is linear in its knots; a short Adam regression for any
-  other potential.
+* ``warmstart_potential`` -- set a potential so ``potential.on_grid(grid) == u_target``
+  for an externally supplied ``[G]`` profile.  Exact (least squares), because the
+  spline is linear in its knot heights.
 * ``estimate_rates`` / ``stream_rates`` -- initial ``EffectiveRates`` from a photon
   ``Batch``.  They are NOT interchangeable: ``estimate_rates`` splits the observed rate
   by channel, ``stream_rates`` solves the emission model for the per-dye brightness.
@@ -41,39 +40,21 @@ import torch
 import numpy as np
 
 from .config import DTYPE
-from .potential import SplinePotential
 from .photophysics import EffectiveRates
 
 
-def warmstart_potential(
-    potential,
-    grid: torch.Tensor,
-    u_target,
-    *,
-    steps: int = 500,
-    lr: float = 0.05,
-):
+def warmstart_potential(potential, grid: torch.Tensor, u_target):
     """Set ``potential`` so ``potential.on_grid(grid) ~= u_target`` (in place).
 
-    ``SplinePotential`` is fit exactly by least squares (linear in its knots);
-    any other potential (e.g. the MLP) is regressed to the target with a short
-    Adam loop.  Returns the (mutated) potential.
+    One least-squares solve: the spline is linear in its knot heights, so this is
+    the exact projection of ``u_target`` onto the knot basis, not an iterative fit.
+    Returns the (mutated) potential.
     """
     u_target = torch.as_tensor(u_target, dtype=DTYPE, device=grid.device).reshape(-1).detach()
-
-    if isinstance(potential, SplinePotential):
-        M = potential._basis(grid)                            # [G, n_knots]
-        sol = torch.linalg.lstsq(M, u_target.unsqueeze(1)).solution.reshape(-1)
-        with torch.no_grad():
-            potential.theta.copy_(sol)
-        return potential
-
-    opt = torch.optim.Adam(potential.parameters(), lr=lr)
-    for _ in range(steps):
-        opt.zero_grad()
-        loss = ((potential.on_grid(grid) - u_target) ** 2).mean()
-        loss.backward()
-        opt.step()
+    M = potential._basis(grid)                                # [G, n_knots]
+    sol = torch.linalg.lstsq(M, u_target.unsqueeze(1)).solution.reshape(-1)
+    with torch.no_grad():
+        potential.theta.copy_(sol)
     return potential
 
 

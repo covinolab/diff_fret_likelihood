@@ -5,32 +5,37 @@ import torch
 import diff_fret_likelihood as dfl
 
 
-def test_force_equals_neg_grad():
+def test_force_gradcheck_in_theta():
+    """gradcheck of ``force`` w.r.t. the KNOT HEIGHTS (SPEC gate 1).
+
+    The spline's force is analytic in ``theta`` and only in ``theta``: the basis is
+    built in NumPy, so ``x`` is not on the autograd graph at all.  That is the whole
+    point -- the joint objective needs d(force)/d(theta) -- so gradcheck must be run
+    against theta.  (Until 0.2.0 this checked d/dx, which was meaningful only for the
+    MLP parameterisation; against a spline it silently compared two zeros, because a
+    fresh potential has theta = 0 and the derivative basis is contracted with it.)
+    """
     grid = dfl.GridConfig(4.0, 8.0, 10).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="mlp", hidden=(8, 8)), grid)
-    x = torch.linspace(4.2, 7.8, 7, requires_grad=True)
-    u = pot(x)
-    (g,) = torch.autograd.grad(u.sum(), x, create_graph=True)
-    assert torch.allclose(pot.force(x), -g, atol=1e-10)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
+    x = torch.linspace(4.5, 7.5, 5, dtype=torch.float64)
+    M_der = pot._basis(x, deriv=1)
 
+    def f(theta):
+        return -(M_der @ theta)
 
-def test_force_gradcheck():
-    """torch.autograd.gradcheck on a small net in float64 (SPEC gate 1)."""
-    grid = dfl.GridConfig(4.0, 8.0, 10).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="mlp", hidden=(6,)), grid)
-
-    def f(x):
-        return pot.force(x)
-
-    x = torch.linspace(4.5, 7.5, 5, dtype=torch.float64, requires_grad=True)
-    assert torch.autograd.gradcheck(f, (x,), atol=1e-6, rtol=1e-4)
+    theta0 = torch.tensor([0.3, -0.9, 0.6, 0.2, -0.4, 0.8],
+                          dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(f, (theta0,), atol=1e-6, rtol=1e-4)
+    with torch.no_grad():
+        pot.theta.copy_(theta0)
+    assert torch.allclose(pot.force(x), f(theta0), atol=1e-12)
 
 
 def test_spline_force_matches_numeric():
     """SplinePotential.force (analytic derivative basis) must not raise and must
     match a finite-difference of forward, and stay differentiable in theta."""
     grid = dfl.GridConfig(4.0, 8.0, 50).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.2, -0.6, 0.9, -0.3, 0.5, -0.1]))
     x = torch.linspace(4.3, 7.7, 9)

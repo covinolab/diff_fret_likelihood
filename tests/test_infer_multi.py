@@ -31,7 +31,7 @@ _THETA = [0.2, -0.8, 0.9, -0.5, 0.7]
 def _fresh_pot(grid, theta=_THETA):
     """A fresh spline potential (fit mutates ``theta`` in place, so never share)."""
     pot = dfl.build_potential(
-        dfl.PotentialConfig(kind="spline", n_knots=len(theta)), grid
+        dfl.PotentialConfig(n_knots=len(theta)), grid
     )
     with torch.no_grad():
         pot.theta.copy_(torch.as_tensor(theta, dtype=torch.float64))

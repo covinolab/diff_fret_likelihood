@@ -26,7 +26,7 @@ def _setup(G=6, n_knots=4, theta=(1.0, -0.5, 0.7, -1.2), D=8.0, K=8, seed=3,
     C = consts.crosstalk_tensor()
     if rates is None:
         rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=n_knots), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=n_knots), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor(theta[:n_knots]))
     times = torch.cumsum(torch.rand(K) * gap_scale, 0)
@@ -196,7 +196,7 @@ def test_sample_paths_match_gamma_and_two_slice():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=3), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=3), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.8, -0.6, 0.5]))
     D = torch.tensor(8.0)
@@ -253,7 +253,7 @@ def test_reconstruction_follows_the_colours():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=4), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=4), grid)
     with torch.no_grad():
         pot.theta.zero_()                       # flat -> the data, not the prior, decides
     n = 20

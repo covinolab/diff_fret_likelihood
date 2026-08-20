@@ -1,66 +1,122 @@
-# `diff_fret_likelihood`
+# diff_fret_likelihood
 
-A differentiable likelihood for **continuous-illumination smFRET photon streams**.
-It scores the *actual inter-photon times* with a marked (coloured) inhomogeneous
-Poisson observation model — no binning — and parameterises the free-energy
-landscape `u_θ(x)` with a neural network or a cubic spline. The potential shape,
-the diffusion coefficient `D`, and the photophysics are all differentiable, so
-they can be estimated by gradient descent (MAP), bounded by the Cramér–Rao
-inequality, or explored by HMC (full posterior).
+Get a free-energy landscape out of a single-molecule FRET photon stream.
 
-## Model
+You hand it the arrival times and colours of the photons your detectors
+recorded during a continuous-illumination smFRET experiment. It hands back the
+free-energy landscape `U(x)` along the FRET coordinate and the diffusion
+coefficient `D` of the molecule moving on it, by maximum likelihood. The photon
+times are used as they were measured — nothing is binned into frames, and no
+discrete set of states is assumed. The whole model is written in PyTorch and is
+differentiable end to end, which is what makes the fit ordinary gradient descent
+and the error bars cheap to compute.
 
-Units are **ms / nm / kHz** throughout. Overdamped Langevin dynamics on a reduced
-potential `u = U / k_BT`:
+## What you need
 
-    dx = -D u'(x) dt + sqrt(2D) dW,     π(x) ∝ e^{-u(x)}
+| | package | why |
+|---|---|---|
+| **required** | Python ≥ 3.10, [PyTorch](https://pytorch.org) ≥ 2.1, numpy ≥ 1.24, scipy ≥ 1.10 | the likelihood and the fit |
+| **for simulated data** | GSL (`libgsl-dev`) and `pkg-config` | system libraries for the built-in trace simulator |
+| optional | `pyro-ppl` ≥ 1.9 (extra `sampling`), `arviz` ≥ 0.17 (extra `diagnostics`) | full posterior sampling instead of a single fit |
+| optional | `pytest`, `matplotlib` (extra `dev`) | running the test suite |
 
-FRET efficiency and per-channel emission intensities (green `G`, red `R`):
+Nothing in this README needs the optional packages.
 
-    E(x)   = R0^6 / (R0^6 + x^6)
-    μ_G(x) = a_g [C_gg(1-E) + C_rg E] + bg_g
-    μ_R(x) = a_r [C_gr(1-E) + C_rr E] + bg_r
-
-The four positive rates `a_g, a_r, bg_g, bg_r` (brightnesses and backgrounds) are
-the identifiable emission parameters exposed to the optimiser; `R0` and the
-crosstalk matrix `C` (with `C_gg = 1-C_gr`, `C_rr = 1-C_rg`) are fixed calibration.
-
-The marginal likelihood of a trace with photons `c_1..c_K` at gaps `τ_1..τ_K` on a
-spatial grid, using the detailed-balance Smoluchowski generator `L`, `Λ = diag(μ)`
-and per-colour emission `V_c = diag(μ_c)`:
-
-    p = 1ᵀ e^{(L-Λ)(T-t_K)} V_{c_K} e^{(L-Λ)τ_K} … V_{c_1} e^{(L-Λ)τ_1} p_0
-
-It is evaluated in the symmetric basis (`s_i = e^{-u_i/2}`) via a single `eigh` of
-the tilted generator `A = L_sym - Λ`; each inter-photon gap is then two mat-vecs
-sharing that spectrum, with a running log-normaliser in float64. See `forward.py`.
-
-## Installation
-
-The likelihood itself is pure PyTorch. The optional trace **simulator** is a
-Cython extension linking the GNU Scientific Library (GSL).
+## Install
 
 ```bash
-# 1. PyTorch (>= 2.1) — install the CPU/CUDA build for your platform first;
-#    it is deliberately not pinned as a dependency.  See https://pytorch.org
-# 2. GSL (only needed for the simulator):
-#    apt-get install libgsl-dev pkg-config   # or: dnf install gsl-devel pkgconf-pkg-config
-#    conda install -c conda-forge gsl pkg-config   # or: brew install gsl pkg-config
+# 1. PyTorch first, in the CPU or CUDA flavour your machine wants.
+#    It is deliberately NOT a pinned dependency -- see https://pytorch.org
+pip install torch
 
-pip install .                          # portable build
-DFL_NATIVE=1 pip install .             # CPU-specific fast-math build (faster, non-portable)
-pip install -e . --no-build-isolation  # editable dev install (builds against your numpy)
+# 2. GSL, only if you want to simulate traces. It is a system library, not a
+#    pip package:
+sudo apt-get install libgsl-dev pkg-config     # Debian / Ubuntu
+# conda install -c conda-forge gsl pkg-config  # conda
+# brew install gsl pkg-config                  # macOS
+
+# 3. This package
+pip install .
 ```
 
-Optional extras: `.[sampling]` (pyro HMC/NUTS), `.[diagnostics]` (arviz R-hat/ESS),
-`.[dev]` (pytest + all optionals). If GSL is missing, `import diff_fret_likelihood`
-still works — only `simulate.simulate_equilibrium` requires the compiled extension.
+Two variants worth knowing about:
 
-**float64.** Importing the package does not change global torch state. The
-likelihood needs double precision (the `eigh` + log-normalisers), so call
-`dfl.use_float64()` once before building anything, or pass `dtype=dfl.DTYPE`.
+```bash
+DFL_NATIVE=1 pip install .              # faster simulator, compiled for THIS cpu only
+pip install -e . --no-build-isolation   # editable install, for working on the code
+```
 
-## Quick start — MAP fit
+If GSL is missing, `import diff_fret_likelihood` still works and you can still
+fit your own data — only the trace simulator is unavailable.
+
+## Units
+
+Everything is in these units, with no conversion happening anywhere. If you feed
+in seconds, you will get a wrong answer rather than an error.
+
+| quantity | unit |
+|---|---|
+| times, inter-photon gaps, window length | milliseconds (ms) |
+| distance: `x`, the Förster radius `R0`, the grid | nanometres (nm) |
+| diffusion coefficient `D` | nm² / ms |
+| all rates: brightness, background, emission | kHz (= 1/ms) |
+| free energy `U(x)` | kT (thermal energy units) |
+
+Call `dfl.use_float64()` once before you build anything. The likelihood needs
+double precision to be accurate; importing the package deliberately does not
+change PyTorch's global settings behind your back.
+
+## Your data: the photon trace format
+
+Every function here takes a `Batch` — the photons of one experiment, one row per
+molecule, all tensors on the same device:
+
+| field | shape | meaning |
+|---|---|---|
+| `ipt` | `[B, Kmax]` | gap since the previous photon, in ms; `ipt[:, 0] = 0` |
+| `colors` | `[B, Kmax]` | `0` = green photon, `1` = red photon |
+| `mask` | `[B, Kmax]` | `True` where there is a real photon |
+| `lengths` | `[B]` | number of photons in each trace |
+| `T` | `[B]` | length of each observation window in ms |
+
+`B` traces of different lengths are padded out to the longest one, `Kmax`, and
+`mask` says which entries are real; the padding is ignored. Each trace must be
+sorted in time. The first photon starts the clock (`ipt[:, 0] = 0`), so the
+window is `T = ipt.sum() = t_last - t_first`.
+
+This is all it takes to build one from your own photon lists:
+
+```python
+import numpy as np
+import torch
+import diff_fret_likelihood as dfl
+
+def make_batch(traces, device="cpu"):
+    """traces: list of (times, colors) per molecule. times in ms, sorted."""
+    B, Kmax = len(traces), max(len(t) for t, _ in traces)
+    ipt     = torch.zeros(B, Kmax, dtype=torch.float64)
+    colors  = torch.zeros(B, Kmax, dtype=torch.int64)
+    mask    = torch.zeros(B, Kmax, dtype=torch.bool)
+    lengths = torch.zeros(B, dtype=torch.int64)
+    T       = torch.zeros(B, dtype=torch.float64)
+    for b, (t, c) in enumerate(traces):
+        t, n = np.asarray(t, dtype=float), len(t)
+        ipt[b, 1:n] = torch.as_tensor(np.diff(t))     # ipt[b, 0] stays 0
+        colors[b, :n] = torch.as_tensor(np.asarray(c, dtype=np.int64))
+        mask[b, :n] = True
+        lengths[b] = n
+        T[b] = t[-1] - t[0]
+    return dfl.simulate.Batch(ipt, colors, mask, lengths, T).to(device)
+```
+
+That is the whole data contract. If your files give you photon times and colours
+per molecule, you are ready to fit.
+
+## Example 1 — fit a landscape
+
+Two steps: get some data, then fit it. Here the data is simulated so the example
+runs on its own and you can compare the answer to the truth; substitute
+`make_batch(...)` above for your own traces.
 
 ```python
 import numpy as np
@@ -68,242 +124,112 @@ import diff_fret_likelihood as dfl
 
 dfl.use_float64()
 
-# --- ground-truth model (ms / nm / kHz) ---
-# The simulator has no reflecting boundary, so U must confine the particle:
-# use a WIDE knot domain with steep walls; score the fit on the FRET band only.
-R0 = 6.0
-x_knots = np.linspace(2.0, 10.0, 15)                            # nm (wide, self-confining)
-y_knots = 4.0 * (((x_knots - 6.0) / 1.2) ** 2 - 1.0) ** 2       # U(x_knots) in kT: wells 4.8/7.2, 4 kT barrier
-D_true  = 10.0                                                  # nm^2/ms
-kD, eta_g, eta_r = 6.0, 0.85, 0.85                              # kHz, detection efficiencies
-beta_g, beta_r   = 0.425, 0.85                                  # kHz, DETECTED background
-C_gr, C_rg = 0.10, 0.05                                         # crosstalk
+# --- a molecule to simulate: a double well, plus the photophysics ---
+R0      = 6.0                                                # Förster radius, nm
+x_knots = np.linspace(2.0, 10.0, 15)                         # nm
+y_knots = 4.0 * (((x_knots - 6.0) / 1.2) ** 2 - 1.0) ** 2    # U at the knots, kT
+D_true  = 10.0                                               # nm^2/ms
+kD, eta_g, eta_r = 6.0, 0.85, 0.85          # donor brightness (kHz), efficiencies
+beta_g, beta_r   = 0.425, 0.85              # detected background per channel, kHz
+C_gr, C_rg       = 0.10, 0.05               # channel crosstalk
 
-# --- simulate photon streams (CPU-only Cython simulator; run before any CUDA) ---
 batch = dfl.simulate.simulate_equilibrium(
     x_knots, y_knots, D_true, R0, kD, beta_g, beta_r, eta_g, eta_r, C_gr, C_rg,
-    T=150.0, dt=5e-6, n_traces=64, seed=0,
-)                                                               # -> dfl.simulate.Batch
+    T=150.0, dt=5e-6, n_traces=32, seed=0,
+)
+```
 
-# --- fit (grid = FRET-observable band, not the wide simulation domain) ---
-device = "cpu"                                                  # or "cuda"
-grid   = dfl.GridConfig(x_min=3.5, x_max=8.5, n_grid=160).build(device)
-pot    = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=9), grid).to(device)
-consts = dfl.PhysicsConstants(R0=R0)                            # C_gr=0.10, C_rg=0.05 defaults
-rates  = dfl.EffectiveRates.from_physics(kD, eta_g, eta_r, beta_g, beta_r, device=device)
+The landscape is defined by its value at 15 knots between 2 and 10 nm — two
+wells at 4.8 and 7.2 nm separated by a 4 kT barrier. That range is deliberately
+much wider than the part FRET can see: the steep walls of `U` are the only thing
+keeping the simulated molecule in, and a walker that wanders past 2 or 10 nm has
+its trace thrown away.
+
+Now the fit. The grid it is fitted on is the *narrow* window, 3.5 to 8.5 nm,
+because that is the range where the FRET efficiency actually changes with
+distance and the photons therefore carry information about position:
+
+```python
+grid   = dfl.GridConfig(x_min=3.5, x_max=8.5, n_grid=160).build("cpu")
+pot    = dfl.build_potential(dfl.PotentialConfig(n_knots=9), grid)
+consts = dfl.PhysicsConstants(R0=R0)
+rates  = dfl.EffectiveRates.from_physics(kD, eta_g, eta_r, beta_g, beta_r)
 
 res = dfl.fit(
-    batch.to(device), grid, pot,
-    C=consts.crosstalk_tensor(device), R0=consts.R0,
-    D_init=5.0, rates_init=rates,
-    prior=dfl.PriorConfig(curvature_weight=0.05),
+    batch, grid, pot,
+    C=consts.crosstalk_tensor(), R0=consts.R0,
+    D_init=5.0,                    # starting guess for D
+    rates_init=rates,              # photophysics, held fixed here
+    prior=dfl.PriorConfig(curvature_weight=0.002),
     fit_D=True, fit_rates=False,
 )
 
-U = dfl.recovered_potential(res.potential, grid)                # [G] recovered U(x), grid-mean 0
-print(res.D, res.best_loss)
+U = dfl.recovered_potential(res.potential, grid)   # [160] landscape in kT
+print(res.D, res.stop_reason)
 ```
 
-`fit` returns a `FitResult` (`.potential`, `.D`, `.rates`, `.best_loss`,
-`.history`, `.stop_reason`). It runs a guarded LBFGS: one quasi-Newton step per
-outer step (`max_iter=1`, **no line search** -- strong-Wolfe returns a zero step
-on this objective), with a best-loss snapshot restored on any non-finite
-loss/parameter and a plateau stop once the best loss stops improving.
-`stop_reason` is `"plateau@N"`, `"recovered@N"` (non-finite hit; best snapshot
-restored), `"converged@N"` (LBFGS internal tolerance) or `"max_steps"`. Tune via
-`optim=dfl.OptimConfig(steps=...,
-lbfgs_lr=..., stop_patience=..., stop_min_delta=...)` (defaults: 600-step cap,
-`lr=1.0`, patience 50, 0.1 nats).
+```
+D = PLACEHOLDER_D nm^2/ms   (true 10.0)   stop: PLACEHOLDER_STOP
+```
 
-## Posterior sampling (HMC)
+About PLACEHOLDER_FITTIME on a laptop CPU, plus PLACEHOLDER_SIMTIME to simulate
+the traces. Reading the output:
 
-`sample.sample_posterior` draws from the full posterior with pyro NUTS/HMC,
-reusing `neg_log_posterior` verbatim as the potential energy. Two requirements:
+* `U` is the landscape on the 160 grid points, shifted so its average is zero.
+  Only *differences* in `U` mean anything — a landscape and the same landscape
+  moved up by 3 kT describe the same physics and fit the data equally well.
+* `res.D` is the fitted diffusion coefficient in nm²/ms, `res.rates` the
+  photophysics (unchanged here, since `fit_rates=False`).
+* `res.stop_reason` tells you how the fit ended. `plateau@N` is the normal one:
+  it stopped improving at step N. `max_steps` means it ran out of steps and you
+  should raise them; `recovered@N` means a step blew up and the best earlier
+  state was restored, usually a sign of too little data or a grid that is too
+  wide.
+* `curvature_weight` is a mild smoothness preference on `U`, which keeps the
+  landscape from growing wiggles the photons cannot justify. Set `prior=None`
+  for a pure unpenalised maximum-likelihood fit — honest, but it needs a lot
+  more photons to behave.
 
-* **A proper landscape prior** — set `prior.gp_sigma`. The curvature penalty alone
-  is improper (constant/linear directions unpenalised) and HMC will not mix;
-  sampling raises if `gp_sigma is None`.
-* Use the **spline** potential (low-dimensional; the GP prior acts on its knots).
-  The additive gauge constant of `U` is pinned internally by a Gaussian anchor.
+## Example 2 — error bars
+
+How well is the landscape actually determined by this much data? Continuing from
+Example 1:
 
 ```python
-prior = dfl.PriorConfig(gp_sigma=1.5, gp_lengthscale=1.0, gp_kernel="matern52")
+crb = dfl.cramer_rao_bound(batch, grid, res.potential, res.D, res.rates,
+                           C=consts.crosstalk_tensor(), R0=consts.R0)
 
-post = dfl.sample.sample_posterior(
-    batch.to(device), grid, pot,
-    C=consts.crosstalk_tensor(device), R0=consts.R0,
-    prior=prior, rates_init=rates, D_init=5.0,
-    num_samples=1000, warmup=400, map_warmstart=True,          # start at MAP -> short burn-in
-)
-
-U_mean = post.U_mean()               # [G] posterior-mean landscape (grid-mean 0)
-lo, hi = post.U_band((0.05, 0.95))   # [2, G] 90% band of U(x)
-D_draws = post.D                     # [S] posterior draws of D
-
-# multi-chain R-hat / ESS (needs arviz):
-multi = dfl.sample.sample_posterior_multi(
-    batch.to(device), grid, pot, C=consts.crosstalk_tensor(device), R0=consts.R0,
-    prior=prior, rates_init=rates, D_init=5.0, num_chains=4, num_samples=1000,
-)
-print(multi.summary())
+print(f"D = {res.D:.2f} +/- {crb.sigma_physical['D']:.2f} nm^2/ms")
+for x, u, s in zip(res.potential.knots_x, res.potential.theta.detach(),
+                   crb.sigma_physical["knots"]):
+    print(f"U({float(x):.2f} nm) = {float(u):+.2f} +/- {s:.2f} kT")
+print("unconstrained directions:", crb.null_dim)
 ```
 
-Mixing knobs on `sample_posterior`: `full_mass` (dense vs diagonal adapted mass),
-`max_tree_depth`, `step_size`/`target_accept`, `sampler="nuts"|"hmc"`.
-
-## Cramér–Rao bound
-
-The lower bound on the covariance of any unbiased estimator of
-`[landscape knots | D | rates]`, from the Fisher information at the given
-parameters (requires a `SplinePotential`):
-
-```python
-crb = dfl.cramer_rao_bound(
-    batch.to(device), grid, res.potential, res.D, res.rates,
-    C=consts.crosstalk_tensor(device), R0=consts.R0,
-)
-print(crb.sigma_physical["D"])        # σ_D lower bound (nm^2/ms)
-print(crb.sigma_physical["knots"])    # per-knot σ (kT)
+```
+PLACEHOLDER_CRB_OUTPUT
 ```
 
-The Gaussian **gauge anchor** (`gauge_sd`, default `1.0`, the same one `fit` uses) is
-always included — the landscape offset is an exact flat direction, so without it the
-information matrix is singular and only an SVD threshold stands between you and a
-meaningless number. With it, `F_N + H_gauge` is inverted exactly by Cholesky. The cost
-is confined to the per-knot σ, which carry `gauge_sd²` of extra variance:
-`cov = pinv(F_N) + gauge_sd²·K·v vᵀ` exactly, with `v` the unit constant-knot
-direction. Since `v` is zero on `logD` and the rates, **σ_D, σ_rates and every
-gauge-blind functional** (barrier heights, CRB bands) are unaffected. `gauge_sd=None`
-restores the unanchored pseudo-inverse and warns.
+This is the Cramér–Rao bound: the smallest error bar *any* unbiased method could
+achieve from this many photons. Treat it as the best case — a real fit does not
+beat it and usually does slightly worse. It costs one pass over the traces
+(PLACEHOLDER_CRBTIME here), which is why it is the cheap way to answer "do I
+need more molecules?" before taking more data.
 
-Pass a proper `prior` (with `gp_sigma`) to also add the prior's Hessian, giving the
-**posterior** covariance (the analytic Laplace precision) rather than the likelihood
-bound; that is what pins knots the data never see, which the anchor alone cannot do.
-Evaluate at a `fit` MAP for the Laplace interpretation, or at the truth for the bound
-at truth.
+Two things to keep in mind when reading the numbers:
 
-## Reconstructing the hidden trajectory
+* `crb.null_dim` should be `0`. Anything larger counts directions in the
+  landscape that the data does not constrain at all — normally knots sitting
+  where the molecule never went, or a grid stretching past the FRET-visible
+  range.
+* Because the overall height of `U` is arbitrary, every per-knot `±` carries
+  that arbitrary offset in it. Differences are determined much better than the
+  individual numbers look: a barrier height `U(top) - U(well)` has a smaller
+  error bar than adding the two `±` above would suggest.
 
-Running the filter once forward and once backward answers "what did the molecule
-actually do?". With the backward filter `β(x,t)` (the adjoint of the tilted
-generator, `β(·,T) = 1`, `β(·,t_k⁻) = μ_{c_k} β(·,t_k⁺)`), the likelihood can be
-evaluated by stopping anywhere,
-
-```
-log L = log ⟨β(·,t), ρ(·,t)⟩     for any t ∈ [0, T],
-```
-
-and the posterior over the latent coordinate given *all* the data — the smoothing
-distribution — is `γ(x,t) = β(x,t) ρ(x,t) / L`:
-
-```python
-res = dfl.reconstruct_trace(
-    times, colors, T, res_fit.potential, res_fit.D, res_fit.rates,
-    grid, consts.crosstalk_tensor(), consts.R0,
-    t_out=torch.arange(0.0, T, 0.1),   # None -> report at the photon times
-    n_paths=5,                         # exact posterior sample trajectories
-)
-res.x_mean, res.x_sd     # [M] reconstruction with error bands (nm)
-res.paths                # [5, M] sampled trajectories, dynamically admissible
-res.loglik, res.loglik_spread   # log L via ⟨β,ρ⟩ and its constancy over t
-```
-
-`loglik_spread` is a sharp self-test on the whole evaluator: `⟨β,ρ⟩` must be the
-same at every `t` and equal `marginal_loglik` (~1e-12 in practice).
-
-`gamma` is the full answer; the rest is one line from it — in particular
-
-```python
-E_mean = res.gamma @ dfl.fret_efficiency(res.grid, consts.R0)
-```
-
-is the model's posterior FRET efficiency, the calibrated counterpart of a binned
-"apparent E(t)" trace. Note `E_mean ≠ E(x_mean)`. The pointwise mode is
-`res.grid[res.gamma.argmax(-1)]`, which differs from `x_mean` exactly when `γ` is
-bimodal — for a hopping molecule the *mean* sits on the barrier top, where the
-molecule essentially never is; sampled `paths` are the honest single-trajectory view.
-
-Cost is ~2× one likelihood evaluation (plus one pass per sampled path), it runs
-under `no_grad` in float64, and the reconstruction near either end of the window is
-prior-dominated over roughly one relaxation time. `reconstruct_batch` loops over the
-traces of a `Batch`.
-
-## Bring your own data
-
-The likelihood consumes a `simulate.Batch` — padded per-trace tensors, all on one
-device:
-
-| field | shape | meaning |
-|---|---|---|
-| `ipt` | `[B, Kmax]` | inter-photon gaps (ms); `ipt[:, 0] = 0` |
-| `colors` | `[B, Kmax]` | int64, `0` = green, `1` = red |
-| `mask` | `[B, Kmax]` | bool; `True` for real photons |
-| `lengths` | `[B]` | photons per trace |
-| `T` | `[B]` | window length (ms) `= sum(ipt)` |
-
-Build one from your own `(times, colors)` arrays by sorting each trace, taking
-`ipt = [0, *diff(times)]`, and zero-padding to the longest trace.
-
-## Priors
-
-`PriorConfig` (evaluated in one place, `objective.prior_penalty`, so
-`neg_log_posterior = -loglik + prior_penalty`). Every term is off by default —
-`PriorConfig()` is pure MLE:
-
-* `curvature_weight` — grid-invariant roughness `≈ ∫ (u'')² dx` (improper; good for MAP).
-* `gp_sigma` / `gp_lengthscale` / `gp_kernel` — a **proper** stationary-kernel GP
-  prior over `U(x)` (`rbf` | `matern32` | `matern52`), gauge-invariant. **Required
-  for HMC.** Use it as the single shape prior (`curvature_weight=0`).
-* `logD_mean` / `logD_std` — weak Gaussian prior on `log D`.
-* `l2_weight` — weak L2 on the potential parameters.
-
-Inspect active terms with `prior.active_terms()` / `prior.describe()`. Pass
-`prior=None` to `fit` for a pure MLE (or `PriorConfig.none()` where an instance is
-required); HMC requires a proper prior and raises on `None`.
-
-The **gauge anchor** is deliberately *not* one of these terms. It pins the offset of
-`U` (a coordinate choice, not a belief), so it is applied unconditionally by `fit`,
-`fit_multi`, the sampler and `cramer_rao_bound` — independently of `prior` — and is
-tuned by the separate `gauge_sd` argument.
-
-## Potentials
-
-`build_potential(PotentialConfig(kind=...), grid)`:
-
-* `kind="mlp"` — smooth-activation MLP; flexible, the general-purpose choice.
-* `kind="spline"` — natural-cubic potential-knot spline (`n_knots`), linear in its
-  knot heights. Low-dimensional; required for `cramer_rao_bound` and the best HMC
-  target. Force `-∇u` is obtained by autodiff for both.
-
-## Performance & precision knobs
-
-On `OptimConfig` (forwarded to the batched likelihood):
-
-* `compile=True` (`compile_mode="default"` | `"reduce-overhead"`) — `torch.compile`
-  the photon recursion; numerically transparent.
-* `propagate_dtype=torch.float32` — mixed-precision recursion (fp32 mat-vecs, fp64
-  `eigh` + log-normaliser). Large GPU win where fp64 is throttled.
-
-The eigensolver falls back (CPU-LAPACK → jitter) if cuSOLVER fails to converge on
-steep landscapes; gradients still flow.
-
-## Module layout
-
-| module | role |
-|---|---|
-| `config.py` | dataclasses: `GridConfig`, `PotentialConfig`, `PhysicsConstants`, `PriorConfig`, `OptimConfig` |
-| `potential.py` | `u_θ`: `MLPPotential`, `SplinePotential`; force via autodiff |
-| `photophysics.py` | `E(x)`, crosstalk mixing, emission rates `μ_G, μ_R`, `EffectiveRates` |
-| `generator.py` | detailed-balance Smoluchowski `L`; symmetrisation; validity checks |
-| `forward.py` | marginal log-likelihood (eigendecomp propagator, single + batched); robust `eigh`; compile / fp32 paths |
-| `objective.py` | `neg_log_posterior` (marginal + priors); curvature / GP / `logD` / L2 priors; the gauge anchor |
-| `infer.py` | `fit` / `fit_multi` (guarded-LBFGS MAP, plateau stop); `recovered_potential` |
-| `fisher.py` | `cramer_rao_bound`: Fisher information and CRB (pure or posterior) |
-| `reconstruct.py` | backward filter `β`; smoothing posterior over `x(t)` with error bands; exact posterior sample paths |
-| `sample.py` | HMC/NUTS posterior sampling of `U(x)`, `D`, rates (single / multi-chain) |
-| `init.py` | `warmstart_potential` (fit a potential to a target profile); rough initial `EffectiveRates` |
-| `simulate.py` | Cython simulator wrapper; parallel equilibrium trace generation → `Batch` |
-| `utils.py` | seeding, positivity transforms, log-space helpers |
+Also available: `crb.sigma_physical` has entries for the photophysics rates
+(`a_g`, `a_r`, `bg_g`, `bg_r`, in kHz), and `crb.n_traces` / `crb.n_photons`
+record how much data went in.
 
 ## Tests
 
@@ -311,13 +237,19 @@ steep landscapes; gradients still flow.
 python -m pytest tests -q
 ```
 
-## Conventions & caveats
+## Good to know
 
-* `D` is physical (nm²/ms); the optimiser works in natural-log space (`D = e^{logD}`).
-* Only ~3 nm of `x` is FRET-observable (`E` is steep for `x ≈ [4.4, 7.2]` nm at
-  `R0 = 6`); score `U(x)` on that band. Far wells are FRET-saturated and unidentifiable.
-* Keep `grid` to the data-visited region: a grid running into a high-potential tail
-  (`U ≫ 10 kT`) destabilises the eigendecomposition gradient.
-* If a trace has no absolute first-photon time or window length, the likelihood
-  conditions on the first photon (`t_1 = 0`, `T = t_K`); supply explicit `t_1`/`T`
-  when known.
+* Only about 3 nm of distance is visible to FRET — the efficiency is steep for
+  `x ≈ 4.4 … 7.2` nm when `R0 = 6` nm, and saturated outside. Fit on that band
+  and do not expect to see features beyond it.
+* Keep the grid inside the region the molecule actually visited. A grid reaching
+  up a steep wall of `U` (beyond roughly 10 kT) makes the fit unstable.
+* If your traces have no absolute start time or window length, the likelihood
+  simply conditions on the first photon (`t_1 = 0`, `T = t_last`). Give it the
+  real window when you know it.
+* `D` is a physical number in nm²/ms wherever you see it. Internally the fit
+  works with `log D`, which is why it can never wander negative.
+
+## Licence
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

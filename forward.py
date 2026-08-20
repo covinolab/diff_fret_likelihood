@@ -124,23 +124,6 @@ class Propagator:
         return self.Q @ Vt
 
 
-def build_propagator(
-    potential,
-    D: torch.Tensor,
-    rates: EffectiveRates,
-    grid: torch.Tensor,
-    C: torch.Tensor,
-    R0: float,
-    dx: float,
-    jitter: float = 1e-12,
-    check_spectrum: bool = False,
-) -> Propagator:
-    u_grid = _BasePotential_on_grid(potential, grid)
-    return build_propagator_from_u(
-        u_grid, D, rates, grid, C, R0, dx, jitter, check_spectrum
-    )
-
-
 def build_propagator_from_u(
     u_grid: torch.Tensor,
     D: torch.Tensor,

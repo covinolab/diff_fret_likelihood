@@ -15,7 +15,7 @@ from diff_fret_likelihood import init
 
 def test_warmstart_spline_exact():
     grid = dfl.GridConfig(4.0, 8.0, 50).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     # a target inside the spline's range space is recovered to numerical precision
     theta_true = torch.tensor([0.0, 1.0, -0.5, 0.8, -0.3, 0.4], dtype=torch.float64)
     target = pot._basis(grid) @ theta_true
@@ -24,14 +24,21 @@ def test_warmstart_spline_exact():
     assert torch.allclose(pot.on_grid(grid), target, atol=1e-8)
 
 
-def test_warmstart_mlp_reduces_error():
+def test_warmstart_reduces_error_off_span():
+    """A target the knot basis cannot represent exactly is still projected onto it.
+
+    The test above covers a target built FROM the basis, where the solve is exact.
+    Here the target (a parabola sampled on 60 grid points, 12 knots) is not in the
+    span, so this checks the least-squares projection actually descends rather than
+    only reproducing what it was handed.
+    """
     grid = dfl.GridConfig(4.0, 8.0, 60).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="mlp", hidden=(32, 32)), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=12), grid)
     target = (grid - 6.0) ** 2
     target = target - target.min()
 
     mse0 = float(((pot.on_grid(grid) - target) ** 2).mean())
-    init.warmstart_potential(pot, grid, target, steps=800, lr=0.02)
+    init.warmstart_potential(pot, grid, target)
     mse1 = float(((pot.on_grid(grid) - target) ** 2).mean())
     assert mse1 < 0.3 * mse0, (mse0, mse1)
 
@@ -66,7 +73,7 @@ def kde_setup():
 
 
 def _spline(grid, n_knots=9):
-    return dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=n_knots), grid)
+    return dfl.build_potential(dfl.PotentialConfig(n_knots=n_knots), grid)
 
 
 def _u_true(grid):

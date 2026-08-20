@@ -22,7 +22,7 @@ def _grid(n=20, lo=4.0, hi=8.0):
 
 def _spline(grid, theta):
     pot = dfl.build_potential(
-        dfl.PotentialConfig(kind="spline", n_knots=len(theta)), grid
+        dfl.PotentialConfig(n_knots=len(theta)), grid
     )
     with torch.no_grad():
         pot.theta.copy_(torch.as_tensor(theta, dtype=torch.float64))
@@ -206,9 +206,14 @@ def test_gradcheck_wrt_control_values():
     assert torch.autograd.gradcheck(f, (theta0,), atol=1e-6)
 
 
-def test_grad_flows_to_mlp_params():
+def test_grad_flows_to_potential_params():
     grid = _grid(16)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="mlp", hidden=(8, 8)), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=9), grid)
+    # a NON-flat landscape: gp_penalty is mean-centered, so at theta = 0 the residual
+    # is identically zero and so is every gradient -- the test would pass vacuously.
+    with torch.no_grad():
+        pot.theta.copy_(torch.tensor([0.4, -0.9, 0.7, -0.2, 0.5, 1.1, -0.6, 0.3, 0.8],
+                                     dtype=torch.float64))
     prior = dfl.PriorConfig(curvature_weight=0.0, gp_sigma=2.0)
     gp_penalty(pot, grid, prior).backward()
     grads = [p.grad for p in pot.parameters()]

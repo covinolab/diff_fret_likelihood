@@ -24,9 +24,8 @@ Two requirements make sampling well-posed (both handled here):
   tight Gaussian anchor (``gauge_sd``) pins that pure-gauge direction without
   touching the identifiable landscape shape.
 
-Target the **spline** potential: low-dimensional (n_knots + logD + 4 log-rates),
-with the GP prior acting directly on ``theta``.  The MLP is supported but a poor HMC
-target (thousands of weights, mode/scaling symmetries -> poor mixing).
+The target is the **spline** potential: low-dimensional (n_knots + logD + 4
+log-rates), with the GP prior acting directly on ``theta``.
 
 Flat parameter layout (all unconstrained, matching ``infer.fit`` / ``FreeRates``):
     z = [ potential params | logD | log_a_g, log_a_r, log_bg_g, log_bg_r ]
@@ -132,7 +131,6 @@ def build_log_prob(
 
     specs = _param_specs(potential)
     npot = sum(numel for _, _, numel in specs)
-    is_spline = (len(specs) == 1 and specs[0][0] == "theta")
 
     module = _NLPModule(potential)
     ipt, colors, mask = batch.ipt, batch.colors, batch.mask
@@ -164,14 +162,11 @@ def build_log_prob(
         # Same pure-gauge anchor infer.fit and fisher use (objective.gauge_offset_from_
         # theta). Must read the offset off the swapped z-slice here, not potential.theta
         # (the module's params are only substituted inside functional_call above).
-        # Dropped for the MLP: there `flat_pot` is raw net weights, whose mean is not the
-        # gauge coordinate at all (see objective.gauge_offset on that asymmetry).
-        gauge = gauge_penalty_from_offset(gauge_offset_from_theta(flat_pot), gauge_sd) \
-            if is_spline else torch.zeros((), dtype=z.dtype, device=z.device)
+        gauge = gauge_penalty_from_offset(gauge_offset_from_theta(flat_pot), gauge_sd)
         return -(nlp + rate_prior + gauge)
 
     z0 = _flatten_init(potential, D_init, rates_init)
-    info = dict(specs=specs, npot=npot, is_spline=is_spline, dim=z0.numel(),
+    info = dict(specs=specs, npot=npot, dim=z0.numel(),
                 log_rates0=log_rates0, prior_sample=prior_s)
     return log_prob_func, z0, info
 
@@ -237,7 +232,7 @@ def sample_posterior(
     * ``full_mass`` -- ``True`` (default) adapts a *dense* mass matrix (captures the
       strong GP-knot correlations + very different parameter scales, i.e. the pyro
       equivalent of the old dense Laplace covariance).  ``False`` adapts a diagonal
-      metric (cheaper; use for high-dimensional MLP potentials).  For the dense metric
+      metric (cheaper; only worth it at large ``n_knots``).  For the dense metric
       to be well-estimated, keep ``warmup`` comfortably larger than the parameter
       dimension (pyro's Stan-style windowed adaptation reserves a 75-step start + 50-step
       end buffer, so very short warmups barely adapt it).

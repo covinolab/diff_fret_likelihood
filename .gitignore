@@ -4,15 +4,16 @@ __pycache__/
 *$py.class
 
 # Cython / C extension build artifacts
-# (generated from simulator.pyx via build_cython.py — keep the .pyx/.pxd sources)
+# (generated from the .pyx sources via build_cython.py — keep the .pyx/.pxd sources)
 *.so
 *.o
 *.a
 simulator.c
+doob_tpt.c
 build/
 *.egg-info/
 .eggs/
-.pt
+*.pt
 
 # Test / tooling caches
 .pytest_cache/

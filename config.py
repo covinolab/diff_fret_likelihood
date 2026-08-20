@@ -21,8 +21,7 @@ likelihood path (``config.DTYPE``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -69,21 +68,22 @@ class GridConfig:
 
 @dataclass
 class PotentialConfig:
-    """MLP potential ``u_theta(x)`` (units of k_B T).
+    """Natural-cubic potential-knot spline ``u_theta(x)`` (units of k_B T).
 
-    ``kind='mlp'`` -> smooth-activation MLP (SPEC primary).
-    ``kind='spline'`` -> natural-cubic potential-knot spline (linear in the
-    parameters; a stable low-dimensional alternative used for cross-checks).
+    The free parameters are the ``n_knots`` knot *heights*, so ``u`` is linear in
+    them -- see ``potential.SplinePotential`` for why that linearity matters to the
+    Fisher/CRB and to the gauge anchor.  ``build_potential`` fills ``x_center`` /
+    ``x_scale`` from the grid extent when they are left ``None``, which places the
+    knots uniformly over ``[x_center - x_scale, x_center + x_scale]``.
+
+    (Up to 0.2.0 a ``kind`` field selected between this and an MLP parameterisation.
+    The MLP is gone and so is the field; callers that passed ``kind="spline"`` simply
+    drop the argument.)
     """
 
-    kind: str = "mlp"
-    # --- shared: input normalisation window (defaults to grid extent) ---
+    # --- knot window (defaults to the grid extent, via build_potential) ---
     x_center: float | None = None
     x_scale: float | None = None
-    # --- mlp ---
-    hidden: Sequence[int] = (32, 32)
-    activation: str = "silu"  # smooth; never relu
-    # --- spline ---
     n_knots: int = 9
 
 
@@ -121,12 +121,13 @@ class PhysicsConstants:
 class PriorConfig:
     """Priors / regularisers (SPEC section 9).
 
-    ``curvature_weight`` multiplies the GRID-INVARIANT roughness penalty
-    ``~= integral (u'')^2 dx`` (see ``objective.curvature_penalty``).  Units changed
-    from the legacy ``sum d2^2`` form: the natural range here is O(1e-2 .. 1e-1) and is
-    swept/selected in the benchmark's Phase A.  (Legacy weight ``w_old`` on grid spacing
-    ``dx`` maps to ``w_new = w_old * dx**3``.)  The benchmark stamps
-    ``curvature_units="integral_u2pp_dx"`` in every result row so old/new runs never mix.
+    ``curvature_weight`` multiplies ``objective.curvature_penalty_spline``: the squared
+    (or, with ``curvature_norm="l1"``, absolute) second difference of the KNOT HEIGHTS,
+    summed over interior knots.  It is a bare sum, NOT normalised by knot spacing, so a
+    weight is only meaningful at the ``n_knots`` it was selected at (equivalents scale
+    roughly as ``1/(n_knots-1)``); select it truth-free by held-out likelihood rather
+    than transplanting one.  Grid-independent by construction -- it never touches the
+    fine grid, only the knots that carry the degrees of freedom.
 
     GP prior (``gp_*``): a PROPER stationary-kernel Gaussian-process prior over the
     landscape ``U(x)`` (see ``objective.gp_penalty``).  Where ``curvature_penalty`` is

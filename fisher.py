@@ -73,7 +73,6 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from .config import DTYPE, PriorConfig
@@ -146,30 +145,15 @@ class CRBResult:
 # --------------------------------------------------------------------------- #
 def _knot_basis(potential, grid):
     """(B [G,K], b0 [G]) so that ``on_grid = B @ theta + b0`` (linear knots)."""
-    if not hasattr(potential, "theta"):
+    if not hasattr(potential, "_basis"):
         raise NotImplementedError(
             "cramer_rao_bound requires a SplinePotential (a landscape linear in "
-            f"its knot heights); got {type(potential).__name__}. An MLP potential "
-            "has thousands of parameters and no dense CRB — refit with "
-            "PotentialConfig(kind='spline')."
+            f"its knot heights); got {type(potential).__name__}. The whole scoring "
+            "parameterisation below is the knot vector, so a potential without a "
+            "knot basis has no dense CRB here."
         )
-    if hasattr(potential, "_basis"):
-        B = potential._basis(grid)                       # on_grid = B @ theta
-        b0 = torch.zeros(grid.shape[0], dtype=B.dtype, device=B.device)
-        return B, b0
-    # generic linear-in-theta fallback: probe on_grid at 0 and the unit knots.
-    theta0 = potential.theta.detach().clone()
-    G, K = grid.shape[0], theta0.numel()
-    with torch.no_grad():
-        potential.theta.zero_()
-        b0 = potential.on_grid(grid).clone()
-        B = torch.empty(G, K, dtype=b0.dtype, device=b0.device)
-        for k in range(K):
-            e = torch.zeros_like(theta0)
-            e[k] = 1.0
-            potential.theta.copy_(e)
-            B[:, k] = potential.on_grid(grid) - b0
-        potential.theta.copy_(theta0)
+    B = potential._basis(grid)                           # on_grid = B @ theta
+    b0 = torch.zeros(grid.shape[0], dtype=B.dtype, device=B.device)
     return B, b0
 
 
@@ -471,6 +455,7 @@ def cramer_rao_bound(
     potential : SplinePotential
         The landscape whose knot heights (``.theta``) are the expansion point
         (ground truth for a CRB, or the MAP for a posterior/Laplace covariance).
+        The scoring parameterisation *is* the knot vector, so this is required.
     D : scalar tensor / float
         Diffusion coefficient (nm²/ms) at the expansion point.
     rates : EffectiveRates

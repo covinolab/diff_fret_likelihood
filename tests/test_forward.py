@@ -24,7 +24,7 @@ def test_G1_poisson_identity():
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
     # flat potential
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=2, x_center=6.0, x_scale=1.0)
+    pcfg = dfl.PotentialConfig(n_knots=2, x_center=6.0, x_scale=1.0)
     pot = dfl.build_potential(pcfg, grid)
 
     mu_G, mu_R = _emission_on_grid(grid, rates, C, consts.R0)
@@ -49,7 +49,7 @@ def test_matches_reference_multistate():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=4)
+    pcfg = dfl.PotentialConfig(n_knots=4)
     pot = dfl.build_potential(pcfg, grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([1.0, -0.5, 0.7, -1.2]))
@@ -84,7 +84,7 @@ def test_two_state_fast_vs_reference():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(250.0, 0.9, 0.9, 20.0, 30.0)
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=2)
+    pcfg = dfl.PotentialConfig(n_knots=2)
     pot = dfl.build_potential(pcfg, grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.0, 1.3]))  # 2 wells at different depths
@@ -191,7 +191,7 @@ def test_two_state_gopich_szabo_handcoded():
     oracle = _two_state_gs_loglik(k01, k10, mu_G, mu_R, times, colors, T, p0)
 
     # grid evaluator: spline with 2 knots at the grid points -> u(grid) = theta
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=2), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=2), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([u0, u1]))
     fast = dfl.marginal_loglik(times, colors, T, pot, D, rates, grid, C, consts.R0)
@@ -231,7 +231,7 @@ def test_gradcheck_marginal_loglik():
     grid = torch.linspace(4.0, 8.0, G)
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=4)
+    pcfg = dfl.PotentialConfig(n_knots=4)
     pot = dfl.build_potential(pcfg, grid)
     gaps = torch.rand(6) * 0.02
     times = torch.cumsum(gaps, 0)
@@ -277,7 +277,7 @@ def test_no_double_count_first_gap():
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
     pot = dfl.build_potential(
-        dfl.PotentialConfig(kind="spline", n_knots=2, x_center=6.0, x_scale=1.0), grid)
+        dfl.PotentialConfig(n_knots=2, x_center=6.0, x_scale=1.0), grid)
     mu_G, mu_R = _emission_on_grid(grid, rates, C, consts.R0)
     mu = float(mu_G + mu_R)
 
@@ -299,7 +299,7 @@ def test_marginal_loglik_gap_tiling_guard():
     consts = dfl.PhysicsConstants()
     C = consts.crosstalk_tensor()
     rates = dfl.EffectiveRates.from_physics(300.0, 0.85, 0.85, 25.0, 50.0)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=4), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=4), grid)
     D = torch.tensor(8.0)
     times = torch.tensor([0.002, 0.005, 0.011])
     colors = torch.tensor([0, 1, 0])

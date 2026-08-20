@@ -32,7 +32,7 @@ def small_setup():
     """A tiny grid + potential + rates + a short random photon stream."""
     gcfg = dfl.GridConfig(x_min=4.0, x_max=8.0, n_grid=12)
     grid = gcfg.build()
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=5)
+    pcfg = dfl.PotentialConfig(n_knots=5)
     pot = dfl.build_potential(pcfg, grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.5, -0.3, 0.8, -0.2, 0.4]))

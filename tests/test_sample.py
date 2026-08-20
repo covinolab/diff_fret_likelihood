@@ -15,7 +15,7 @@ from diff_fret_likelihood import sample as S
 def _setup(n_knots=5, n_grid=12, n_traces=3, n_ph=8):
     torch.manual_seed(0)
     grid = dfl.GridConfig(4.0, 8.0, n_grid).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=n_knots), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=n_knots), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.linspace(0.3, -0.3, n_knots))
     consts = dfl.PhysicsConstants()

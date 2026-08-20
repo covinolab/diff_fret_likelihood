@@ -65,7 +65,7 @@ def _make_batch(n_traces=30, K=12, seed=0):
 def crb_setup():
     K = 5
     grid = dfl.GridConfig(4.0, 8.0, 24).build()
-    pcfg = dfl.PotentialConfig(kind="spline", n_knots=K)
+    pcfg = dfl.PotentialConfig(n_knots=K)
     pot = dfl.build_potential(pcfg, grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([2.0, 0.0, 1.5, 0.0, 2.0]))  # bumpy landscape

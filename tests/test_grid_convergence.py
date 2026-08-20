@@ -7,7 +7,7 @@ import diff_fret_likelihood as dfl
 
 def _ll_at(G, times, colors, T, theta_vals):
     grid = dfl.GridConfig(4.0, 8.0, G).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=5), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=5), grid)
     with torch.no_grad():
         pot.theta.copy_(theta_vals)
     consts = dfl.PhysicsConstants()

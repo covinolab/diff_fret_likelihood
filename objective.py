@@ -11,32 +11,13 @@ import math
 
 import torch
 
-from . import potential as dfl_potential
-
 from .config import PriorConfig
-from .forward import marginal_loglik_batch, _BasePotential_on_grid
-from .generator import stationary
+from .forward import marginal_loglik_batch
 
 
 def _scalar_zero(ref: torch.Tensor) -> torch.Tensor:
     """A 0-d zero matching ``ref``'s dtype/device (empty penalty terms)."""
     return torch.zeros((), dtype=ref.dtype, device=ref.device)
-
-
-def curvature_penalty(u_grid: torch.Tensor, dx: float = 1.0) -> torch.Tensor:
-    """Grid-invariant roughness ``~= integral (u''(x))^2 dx``.
-
-    The discrete 2nd difference obeys ``d2_i = u_{i+1}-2u_i+u_{i-1} ~= u''(x_i) dx^2``,
-    so ``sum_i d2_i^2 ~= dx^4 sum_i (u''_i)^2`` and the *resolution-independent*
-    functional ``integral (u'')^2 dx = dx sum_i (u''_i)^2`` equals ``sum_i d2_i^2 / dx^3``.
-    Dividing by ``dx**3`` therefore makes ``curvature_weight`` mean the same physical
-    smoothing across grid resolutions (fixes the D-drifts-with-grid coupling).
-
-    ``dx`` defaults to 1.0 so legacy positional calls keep the old (grid-dependent)
-    behaviour; the objective always passes the real grid spacing.
-    """
-    d2 = u_grid[2:] - 2.0 * u_grid[1:-1] + u_grid[:-2]
-    return (d2 ** 2).sum() / (dx ** 3)
 
 
 def curvature_penalty_spline(theta: torch.Tensor, knots_x: torch.Tensor,
@@ -154,7 +135,7 @@ def gp_penalty(potential, grid: torch.Tensor, prior: PriorConfig) -> torch.Tenso
     fine grid); the residual is MEAN-CENTERED so the prior is gauge-invariant
     (matches the constant-shift invariance of the likelihood / curvature term)
     and shrinks well-depths/barrier-heights symmetrically with SD ``gp_sigma``.
-    Works for both spline (proper prior on ``theta``) and MLP (functional prior).
+    Acts as a proper prior on ``theta``.
 
     Note: the constant ``0.5 logdet(2 pi K)`` is dropped -- valid because the GP
     hyperparameters are FIXED during a fit/chain, so it shifts the loss by a
@@ -210,19 +191,12 @@ def gauge_offset_from_theta(theta: torch.Tensor) -> torch.Tensor:
 def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
     """The pure-gauge offset coordinate of ``U``, from a potential object.
 
-    Delegates to ``gauge_offset_from_theta`` for a spline (the exact flat direction).
-
-    For the MLP (no knots) it falls back to ``mean(U over grid)``, which is NOT an exact
-    flat direction in parameter space -- an MLP cannot in general realise ``U + const``
-    by moving along one parameter direction -- so anchoring it can bias the recovered
-    shape slightly.  ``infer.fit`` accepts that trade for the sake of a converging
-    optimiser; ``sample.build_log_prob`` instead drops the anchor entirely for
-    non-splines.  That asymmetry is deliberate, and moot in practice: no live script
-    fits an MLP, and ``fisher.cramer_rao_bound`` rejects one outright.
+    A thin wrapper over ``gauge_offset_from_theta``: with the spline the only
+    parameterisation, ``mean(theta)`` *is* the exact flat direction, so anchoring it
+    costs nothing on the identified shape.  ``grid`` is unused and kept only because
+    it is part of the signature every caller already passes.
     """
-    if hasattr(potential, "theta"):          # spline: exact flat direction
-        return gauge_offset_from_theta(potential.theta)
-    return potential.on_grid(grid).mean()     # MLP fallback (approximate; see above)
+    return gauge_offset_from_theta(potential.theta)
 
 
 def gauge_penalty_from_offset(offset: torch.Tensor, gauge_sd: float = 1.0) -> torch.Tensor:
@@ -259,15 +233,10 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
 
     reg = _scalar_zero(grid)
     if prior.curvature_weight:
-        if isinstance(potential, dfl_potential.SplinePotential):
-            reg = reg + prior.curvature_weight * curvature_penalty_spline(
-                potential.theta, potential.knots_x,
-                norm=getattr(prior, "curvature_norm", "l2"),
-            )
-        else:
-            u_grid = _BasePotential_on_grid(potential, grid)
-            dx = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
-            reg = reg + prior.curvature_weight * curvature_penalty(u_grid, dx)
+        reg = reg + prior.curvature_weight * curvature_penalty_spline(
+            potential.theta, potential.knots_x,
+            norm=getattr(prior, "curvature_norm", "l2"),
+        )
     if prior.logD_mean is not None:
         reg = reg + logD_penalty(D, prior)
     if prior.bg_g_mean is not None or prior.bg_r_mean is not None:

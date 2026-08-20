@@ -26,7 +26,7 @@ class _Batch:
 
 def _setup(G=24):
     grid = dfl.GridConfig(4.0, 8.0, G).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.3, -0.8, 0.9, -0.5, 0.7, 0.1]))
     consts = dfl.PhysicsConstants()
@@ -117,7 +117,7 @@ def test_fp32_gradient_cosine():
 
 def _fit_D(propagate_dtype):
     grid = dfl.GridConfig(4.0, 8.0, 20).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.2, -0.6, 0.7, -0.4, 0.5, 0.1]))
     consts = dfl.PhysicsConstants()

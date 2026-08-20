@@ -26,7 +26,7 @@ def test_forward_backward_consistency():
     """Sum_i a~_k * b~_k must be constant over k and equal the marginal likelihood."""
     torch.manual_seed(1)
     grid = dfl.GridConfig(4, 8, 20).build()
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.2, -0.8, 0.9, -0.5, 0.7, 0.1]))
     consts = dfl.PhysicsConstants()
@@ -91,7 +91,7 @@ def test_best_loss_matches_objective_at_returned_state():
     prior = dfl.PriorConfig(curvature_weight=0.1, gp_sigma=2.0,
                             logD_mean=math.log(10.0), logD_std=0.5)
     optim = dfl.OptimConfig(steps=20, lbfgs_lr=3.0, log_every=1)
-    pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+    pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
     with torch.no_grad():
         pot.theta.copy_(torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4]))
 
@@ -144,7 +144,7 @@ def test_guard_recovers_and_plateau_stops():
                             logD_mean=math.log(10.0), logD_std=0.5)
 
     def fresh_pot():
-        pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+        pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
         with torch.no_grad():
             pot.theta.copy_(torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4]))
         return pot
@@ -195,7 +195,7 @@ def test_fit_enforces_mean_theta_zero_and_preserves_identified():
     init_theta = torch.tensor([0.5, 0.0, -0.9, 0.8, -0.3, 0.4])
 
     def fresh_pot():
-        pot = dfl.build_potential(dfl.PotentialConfig(kind="spline", n_knots=6), grid)
+        pot = dfl.build_potential(dfl.PotentialConfig(n_knots=6), grid)
         with torch.no_grad():
             pot.theta.copy_(init_theta)
         return pot

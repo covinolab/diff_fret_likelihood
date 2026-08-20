@@ -22,7 +22,7 @@ def _grid(n=16, lo=4.0, hi=8.0):
 
 def _spline(grid, theta):
     pot = dfl.build_potential(
-        dfl.PotentialConfig(kind="spline", n_knots=len(theta)), grid
+        dfl.PotentialConfig(n_knots=len(theta)), grid
     )
     with torch.no_grad():
         pot.theta.copy_(torch.as_tensor(theta, dtype=torch.float64))
