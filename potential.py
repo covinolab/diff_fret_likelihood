@@ -1,30 +1,3 @@
-"""Spline potential ``u_theta(x)`` in units of k_B T.
-
-The marginal likelihood only needs ``u`` on the grid (the detailed-balance
-generator is built from potential *differences*).  The force ``-du/dx`` is
-provided analytically for the secondary joint objective (SPEC section 7.1).
-
-One parameterisation: ``SplinePotential`` -- a natural-cubic potential-knot spline,
-linear in the free knot heights.  That linearity is load-bearing well beyond the fit
-being low-dimensional and stable: ``fisher.cramer_rao_bound`` scores the knot heights
-as a dense parameter vector, and the gauge machinery below identifies the exact flat
-direction with ``mean(theta)`` precisely because ``u = M_val @ theta`` with ``M_val``
-a partition of unity.  (An MLP parameterisation lived here until 0.2.0; it had neither
-property, no analysis used it, and it is gone.)
-
-The additive constant of ``u`` is pure gauge and must not change any observable
-(``tests/test_potential.py``).  Three distinct mechanisms exploit that, and they
-are not interchangeable:
-
-* ``generator.min_gauge`` -- subtract the min wherever ``u`` feeds ``exp(-u)``.  An
-  overflow guard, applied inside the likelihood.
-* ``objective.gauge_penalty`` -- the Gaussian anchor on ``mean(theta)``, which removes
-  the flat direction so optimisers converge and the Fisher is invertible.
-* ``infer.recovered_potential`` -- grid-mean-zero, for reporting only.
-
-This module holds none of them; it just parameterises ``u``.
-"""
-
 from __future__ import annotations
 
 import numpy as np

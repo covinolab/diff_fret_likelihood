@@ -193,13 +193,31 @@ def test_weight_validation():
 
 
 # --------------------------------------------------------------------------- #
-# 5. the sampler refuses prior=None (improper posterior; HMC won't mix)
+# 5. the sampler treats prior=None exactly as the fit does: pure MLE
 # --------------------------------------------------------------------------- #
-def test_sampler_rejects_prior_none():
+def test_sampler_accepts_prior_none_as_pure_mle():
+    """``prior=None`` is MLE for the sampler too -- it targets ``fit``'s objective.
+
+    This file once asserted the opposite: the sampler used to reject ``prior=None`` and
+    demand a proper GP prior. The GP prior went in 0.3.0 and the sampler was rewritten in
+    0.4.0 to stop inventing prior terms of its own, so the target is now exactly
+    ``-(neg_log_posterior + gauge_penalty)`` whatever the prior is -- including nothing.
+    """
     grid, pot, consts, C, rates, D, ipt, colors, mask = _setup()
     batch = _Batch(ipt, colors, mask)
-    with pytest.raises(ValueError):
-        build_log_prob(batch, grid, pot, C, consts.R0, None, rates, D_init=10.0)
-    # NOTE: this file once also asserted the sampler's "needs a proper GP prior" guard.
-    # That guard is gone with the GP prior (dfl 0.3.0) and sample.py is being rewritten,
-    # so only the prior=None rejection -- which is independent of it -- is checked here.
+    gauge_sd = 0.8
+
+    with pytest.warns(RuntimeWarning, match="no prior at all"):
+        logp, z0, info = build_log_prob(batch, grid, pot, C, consts.R0, None, rates,
+                                        D_init=10.0, gauge_sd=gauge_sd)
+
+    npot = info["npot"]
+    theta, D_z = z0[:npot], z0[npot].exp()
+    r = z0[npot + 1:npot + 1 + info["n_sampled_rates"]].exp()
+    with torch.no_grad():
+        pot.theta.copy_(theta)
+    ll = marginal_loglik_batch(ipt, colors, mask, pot, D_z,
+                               dfl.EffectiveRates(r[0], r[1], r[2], r[3]),
+                               grid, C, consts.R0)
+    want = -(-ll + gauge_penalty(pot, grid, gauge_sd))     # no prior term at all
+    assert float(logp(z0)) == pytest.approx(float(want), rel=1e-12)

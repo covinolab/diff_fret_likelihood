@@ -22,9 +22,8 @@ assume rather than re-derive:
 
   * `v` is an EXACT null direction of `F_N` (tested below), so without the anchor the
     posterior precision is singular and has no inverse to report;
-  * a landscape prior cannot stand in for it.  The mean-centred GP prior is itself
-    gauge-invariant, and the curvature prior `D2^T D2` has a 2-dim null space
-    {constant, linear} -- both are structurally blind to the gauge;
+  * a landscape prior cannot stand in for it.  The curvature prior `D2^T D2` has a
+    2-dim null space {constant, linear}, so it is structurally blind to the gauge;
   * conversely the anchor pins exactly ONE direction.  Data that leave other knot
     directions weakly constrained still need a landscape prior for a finite per-knot
     sigma; the anchor does not rescue them.
@@ -173,9 +172,9 @@ def test_anchor_touches_nothing_but_the_gauge_direction(crb_setup, gauge_sd):
     ~1e-17 rounding sign (see the module docstring).  Nothing below depends on which
     inverse branch ran.
 
-    Uses the posterior (GP-prior) CRB so that the gauge is the only null direction of
-    ``A``.  The GP prior is mean-centred, hence gauge-invariant, so it does not pin the
-    gauge itself -- asserted below, and the reason the anchor is not gated on the prior.
+    Uses the posterior CRB so that the gauge is the only null direction of ``A``.  The
+    curvature prior annihilates constants, so it does not pin the gauge itself --
+    asserted below, and the reason the anchor is not gated on the prior.
     """
     s = crb_setup
     K, P = s["K"], s["K"] + 5
@@ -285,6 +284,12 @@ def test_prior_gives_posterior_precision(crb_setup):
     prior_H = res.posterior_precision - res.fisher
     prior_H = 0.5 * (prior_H + prior_H.T)
     assert float(torch.linalg.eigvalsh(prior_H).min()) > -1e-8
+    # everything added -- curvature prior and gauge anchor alike -- lives on the
+    # LANDSCAPE block.  Nothing penalises logD or the four log-rates: a Gaussian rate
+    # prior did until 0.4.0, and this is what catches it if one is ever re-introduced.
+    K = s["K"]
+    assert float(prior_H[K:, K:].abs().max()) == 0.0
+    assert float(prior_H[:K, K:].abs().max()) == 0.0
     # proper prior => nothing dropped and every parameter has a finite, positive sigma
     assert res.null_dim == 0
     assert torch.isfinite(res.sigma).all() and bool((res.sigma > 0).all())
@@ -295,16 +300,19 @@ def test_prior_shrinks_vs_the_anchored_crb(crb_setup):
     s = crb_setup
     K = s["K"]
     crb = _crb(s)                    # anchored, no PriorConfig
-    post = _post(s)                  # anchored + GP prior
+    post = _post(s)                  # anchored + curvature prior
     v = _gauge_dir(K, K + 5, crb.cov.dtype)
-    # both are anchored, so both give the gauge a finite variance; the mean-centered GP
-    # prior is gauge-invariant, so it does not tighten the gauge itself.
+    # both are anchored, so both give the gauge a finite variance; the curvature prior
+    # annihilates constants, so it does not tighten the gauge itself.
     assert float(v @ crb.cov @ v) == pytest.approx(K * 1.0 ** 2, rel=1e-6)
     assert float(v @ post.cov @ v) == pytest.approx(K * 1.0 ** 2, rel=1e-6)
     # adding a prior can only tighten identified directions: posterior sigma <= CRB
-    # sigma on the well-identified params (logD + the 4 log-rates).
+    # sigma on the well-identified params (logD + the 4 log-rates).  Note the curvature
+    # prior does not touch that block at all (asserted in
+    # `test_prior_gives_posterior_precision`) -- these shrink purely through the
+    # Fisher's landscape<->rates coupling, which is why the check is not vacuous.
     for i in range(K, K + 5):
         assert float(post.sigma[i]) <= float(crb.sigma[i]) + 1e-9
-    # and on the landscape block too, where the GP prior actually bites
+    # and on the landscape block too, where the curvature prior actually bites
     for i in range(K):
         assert float(post.sigma[i]) <= float(crb.sigma[i]) + 1e-9

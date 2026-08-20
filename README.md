@@ -276,6 +276,80 @@ data went in. `crb.null_dim` should come out `0`; anything larger counts
 directions in the landscape the data does not constrain at all, normally knots
 sitting where the molecule never went.
 
+## Example 3 — the full posterior
+
+The fit gives one landscape and the Cramér–Rao bound gives the best error bar any
+method could manage. Between them sits the question they cannot answer: what does
+the *posterior* actually look like — is it a tidy ellipse around the fit, or
+something long and banana-shaped that a single number cannot summarise?
+`sample_posterior` answers that by running Hamiltonian Monte Carlo (pyro's NUTS)
+over the same objective the fit minimises. Continuing from Example 1:
+
+```python
+prior = dfl.PriorConfig(curvature_weight=0.002,
+                        bg_g_mean=beta_g, bg_g_sd=0.1 * beta_g,   # calibrated background
+                        bg_r_mean=beta_r, bg_r_sd=0.1 * beta_r)
+
+post = dfl.sample.sample_posterior(
+    batch, grid, pot, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
+    num_samples=400, warmup=400,
+    compile_mode="default", propagate_dtype=torch.float32,   # much faster per gradient
+)
+
+U_mean = post.U_mean()                # [G] posterior-mean landscape, grid-mean 0
+lo, hi = post.U_band((0.05, 0.95))    # [2, G] 90% band of U(x)
+print(f"D = {float(post.D.median()):.2f} "
+      f"[{float(post.D.quantile(0.05)):.2f}, {float(post.D.quantile(0.95)):.2f}]")
+```
+
+You do not have to set up anything before that call. `rates_init` defaults to
+`init.stream_rates`, the landscape is initialised from the FRET histogram
+(`init.kde_potential_init`), and the chain then starts from a quick MAP fit —
+which is what keeps burn-in short. `kde_bin_ms=...` pins the histogram bin width
+and skips the held-out scan that chooses it, which is the expensive part of the
+warm start.
+
+**The sampler targets exactly the objective `fit` minimises**, negated. It adds no
+prior of its own: the curvature and background terms come from the `PriorConfig`
+you pass, exactly as they do for `dfl.fit`, and `prior=None` is a pure
+maximum-likelihood target here just as it is there. So a chain and a fit on the
+same `prior` and `gauge_sd` describe the same posterior — the fit reports its
+mode, the chain its shape.
+
+Multiple chains, which is how you find out whether to believe any of it:
+
+```python
+multi = dfl.sample.sample_posterior_multi(
+    batch, grid, pot, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
+    num_chains=4, num_samples=400, warmup=400,
+    compile_mode="default", propagate_dtype=torch.float32,
+)
+print(multi.summary())        # arviz: R-hat and ESS per parameter
+```
+
+Read `r_hat` first. Anything above about 1.01 means the chains have not agreed and
+the band is not yet a posterior — give it more warmup, or narrow the grid.
+
+Things worth knowing before you trust a band:
+
+* **It is much slower than the fit.** Every leapfrog step costs one gradient of the
+  full likelihood, and NUTS takes tens of them per draw, so a chain is hundreds of
+  times the work of a fit. `compile_mode="default"` and
+  `propagate_dtype=torch.float32` are both worth setting.
+* **The curvature prior does not make the landscape posterior proper.** It
+  penalises roughness and leaves the constant and linear directions of `U` free.
+  The constant is pinned internally by the gauge anchor; the tilt is left to the
+  photons. Keep the grid inside the region they actually inform — the same advice
+  as for the fit, and it matters more here.
+* **Only differences in `U` are meaningful**, so read the band as a band on shape.
+  A barrier height is the honest thing to quote, exactly as in Example 2.
+* `curvature_norm="l1"` is a poor choice for sampling and warns: it is not
+  differentiable where the curvature crosses zero, and the leapfrog integrator
+  cannot cross that kink cleanly. Use the default `"l2"`.
+* **`fit_bg=False`** holds the backgrounds at their calibrated values instead of
+  sampling them. `fit_rates` is a warm-start knob only — the chain always samples
+  the brightnesses, since marginalising over the photophysics is the point.
+
 ## Tests
 
 ```bash

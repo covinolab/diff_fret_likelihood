@@ -19,14 +19,11 @@ cdef double draw_boltzmann_x0(
         int N_grid=2000,
         ):
     """
-    One draw from the equilibrium distribution of the spline potential,
-        p_eq(x) ∝ exp(-U(x)),   kT = 1,
-    where U is the *value* of `spline` (the main loop uses its derivative).
+    One draw from the equilibrium distribution of the spline potential.
 
     Support is the spline's own domain [x_knots[0], x_knots[-1]] — that is
     where U is defined; GSL errors outside it and the integrator aborts a
-    trajectory that leaves it. So this *is* the Boltzmann distribution for
-    this potential, not a range imposed on it.
+    trajectory that leaves it.
 
     Inverse-CDF via trapezoid integration, no heap allocation.
     """
@@ -143,9 +140,7 @@ def eval_spline(
     return y_eval
 
 
-# --------------------------------------------------------------------------- #
-# Photon-buffer sizing
-# --------------------------------------------------------------------------- #
+# Estimate of the maximum photon count per trace, used to size the arrival-time vectors
 # Z standard deviations above the mean bound, plus a constant.  Z = 10 puts the
 # per-trace overflow probability below 1e-15 (Poisson Chernoff) once mu is large;
 # CAP_SLACK covers the small-mu regime, where 10*sqrt(mu) is only a few counts.
@@ -168,7 +163,6 @@ def photon_capacity(
         ):
     """Arrival-time buffer size that ``smFRET_simulator`` cannot overflow.
 
-    ``beta_g``/``beta_r`` are DETECTED background rates (kHz), outside ``eta``.
 
     The emission rates depend on the walker's position only through the FRET
     efficiency ``E(r)``, and ``E`` is confined to ``[0, 1]``.  Since
@@ -179,12 +173,6 @@ def photon_capacity(
     Adding ``CAP_Z`` standard deviations plus ``CAP_SLACK`` therefore bounds the count
     with probability ``1 - 1e-15`` per trace, which is why the simulator can size its
     buffers itself instead of taking a budget from the caller.
-
-    ONE cap serves both channels (the larger of the two bounds), keeping the
-    single-budget structure of the two arrays.  ``T`` rather than ``(N-1)*dt`` is used
-    for the horizon, which only makes the bound more conservative.
-
-    Exposed as a Python function so the bound is directly testable and inspectable.
     """
     # phi_g ranges over [min(C_gg, C_rg), max(C_gg, C_rg)] as E sweeps [0, 1], and
     # phi_r over [min(C_gr, C_rr), max(C_gr, C_rr)].  So the four corners below are

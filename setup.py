@@ -1,18 +1,3 @@
-"""Build the Cython simulator extension for ``diff_fret_likelihood``.
-
-All package metadata lives in ``pyproject.toml``; this file exists only because
-the ``diff_fret_likelihood.simulator`` extension links the system GSL library and
-needs dynamic include/lib discovery (ported from the old ``build_cython.py``).
-
-Environment switches:
-  * ``DFL_NATIVE=1``            build the aggressive, CPU-specific fast-math
-                               variant (non-portable, for in-house benchmarking).
-  * ``GSL_DIR`` / ``EBROOTGSL`` point at a GSL install if pkg-config/gsl-config
-                               cannot find it.
-  * ``DFL_ALLOW_MISSING_GSL``  silence the "GSL not found" warning and try the
-                               compiler's default search path anyway.
-"""
-
 import os
 import subprocess
 import warnings

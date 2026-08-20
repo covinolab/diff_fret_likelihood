@@ -1,37 +1,3 @@
-"""Initializers for the marginal-likelihood fit.
-
-The marginal objective ``-log p`` is non-convex in the landscape parameters, so a
-good starting point matters.  Everything here is pure, used *before* ``fit``, and
-changes nothing in the fit path itself:
-
-* ``warmstart_potential`` -- set a potential so ``potential.on_grid(grid) == u_target``
-  for an externally supplied ``[G]`` profile.  Exact (least squares), because the
-  spline is linear in its knot heights.
-* ``estimate_rates`` / ``stream_rates`` -- initial ``EffectiveRates`` from a photon
-  ``Batch``.  They are NOT interchangeable: ``estimate_rates`` splits the observed rate
-  by channel, ``stream_rates`` solves the emission model for the per-dye brightness.
-  Anything that reads ``a_g``/``a_r`` as brightnesses wants the latter.
-* ``kde_potential_init`` -- the FRET-histogram warm start: bin the photon stream in
-  time, read each window's apparent efficiency, invert the model's own ``E_app(x)`` map
-  to get a distance, KDE those and take ``U = -ln p``.  The bandwidth is fixed by
-  Silverman's rule; the one free knob left, the bin width, is chosen by held-out
-  marginal likelihood.  Its four steps (``fret_positions``, ``silverman_bandwidth``,
-  ``kde_landscape``, ``select_bin_ms``) are public so each can be inspected on its own.
-
-Usage::
-
-    from diff_fret_likelihood import init
-    init.warmstart_potential(pot, grid, u_target)        # u_target: [G] tensor/array
-    rates = init.estimate_rates(batch, bg_frac=0.5, device=device)
-    res = dfl.fit(batch, grid, pot, C, R0, D_init=D0, rates_init=rates, prior=prior)
-
-    # FRET-histogram warm start (sets pot.theta in place, returns the diagnostics).
-    # rates default to stream_rates(batch); D_init comes free with the bin-width scan.
-    ini = init.kde_potential_init(pot, batch, grid, physics)
-    res = dfl.fit(batch, grid, pot, physics.crosstalk_tensor(dev), physics.R0,
-                  D_init=ini.D, rates_init=rates, prior=prior)
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -88,9 +54,6 @@ def estimate_rates(batch, *, bg_frac=0.10, bg_g=None, bg_r=None, device=None):
     return EffectiveRates(t(a_g_val), t(a_r_val), t(bg_g_val), t(bg_r_val))
 
 
-# ---------------------------------------------------------------------------
-# FRET-histogram (KDE) warm start for the landscape
-# ---------------------------------------------------------------------------
 DEFAULT_BIN_MS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.1, 2.5, 3.0, 3.5, 4.2, 5.0, 6.0, 7.2, 8.6)
 
 

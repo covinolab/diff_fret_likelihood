@@ -1,22 +1,3 @@
-"""Light wrapper around the in-project Cython simulator (``simulator.pyx``).
-
-The notebooks and reliability scripts generate photon streams with the
-*in-project* ``smFRET_simulator`` (built via ``build_cython.py``), not the old
-external ``smFRET_sbi`` adapter.  This module provides the shared pieces:
-
-* ``Batch`` -- padded batch of photon-stream traces (the data contract the
-  marked-point-process likelihood consumes);
-* ``_stack`` -- list of ``(ipt, colors)`` numpy arrays -> padded ``Batch``;
-* ``simulate_equilibrium`` -- a parallel rejection loop over ``smFRET_simulator``
-  (the pattern the notebooks previously duplicated inline), collecting usable
-  equilibrium traces into a ``Batch``.
-
-The simulator draws its start position from the Boltzmann equilibrium internally
-and parametrises ``U(x)`` directly by the potential *value* knots ``y_knots =
-U(x_knots)`` -- there is no ``x0`` argument.  Simulation is CPU-only (Cython);
-run it BEFORE any CUDA work.
-"""
-
 from __future__ import annotations
 
 import os
@@ -33,16 +14,9 @@ from .config import DTYPE
 try:
     from .simulator import smFRET_simulator
 except ImportError:
-    # The compiled `diff_fret_likelihood.simulator` extension may not be built
-    # (e.g. GSL missing at install time), so importing `diff_fret_likelihood`
-    # must not require it -- only `simulate_equilibrium` does, and its worker
-    # re-imports it lazily.
     smFRET_simulator = None
 
 
-# ---------------------------------------------------------------------------
-# Padded batch of traces
-# ---------------------------------------------------------------------------
 @dataclass
 class Batch:
     """Padded batch of photon-stream traces (all on ``device``)."""
@@ -85,9 +59,6 @@ def _stack(raw, max_photons, device):
     return Batch(ipt, colors, mask, lengths, Tvec).to(device)
 
 
-# ---------------------------------------------------------------------------
-# Parallel equilibrium simulation (in-project Cython simulator)
-# ---------------------------------------------------------------------------
 def _simulate_chunk(share, budget, seed, params):
     """Local rejection loop -> up to ``share`` accepted ``(ipt, cols)`` traces.
 

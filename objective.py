@@ -1,13 +1,3 @@
-"""Objectives, priors and regularisers.
-
-* ``curvature_penalty_spline`` -- roughness prior on the knot heights (SPEC 9).
-* ``bg_penalty`` -- Gamma prior on the backgrounds, from an independent calibration.
-* ``prior_penalty`` -- the single aggregated ``-log prior`` term (``None`` -> MLE).
-* ``neg_log_posterior`` -- marginal-likelihood-based training objective.
-* ``gauge_*`` -- the anchor on the pure-gauge offset of ``U`` (not a prior; a choice
-  of coordinates, added by ``infer.fit`` rather than by ``prior_penalty``).
-"""
-
 from __future__ import annotations
 
 import torch

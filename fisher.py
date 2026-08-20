@@ -352,26 +352,31 @@ class _PriorModule(torch.nn.Module):
         return prior_penalty(self.potential, D, grid, prior, rates=rates)
 
 
-def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
+def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd):
     """``d²(-log penalty)/dφ²`` at ``phi_star`` — everything added to the Fisher.
 
-    Two independently gated groups, and the distinction is the point:
+    Two independently gated terms, and the distinction is the point:
 
     * the **gauge anchor** (``gauge_sd``) is a choice of coordinates, so it is included
       whenever ``gauge_sd is not None`` — *regardless of* ``prior``.  It is what makes
       the information matrix invertible at all.
-    * the **``PriorConfig`` prior** (curvature and bg, via
-      ``objective.prior_penalty``) and the **Gaussian rate prior** (``rate_sd``) are
-      beliefs about physics, so they opt in together with ``prior``; ``rate_sd`` is
-      ignored when ``prior is None``.
+    * the **``PriorConfig`` prior** (curvature and bg, via ``objective.prior_penalty``)
+      is a belief about physics, so it opts in with ``prior``.
 
     The four log-rates are reconstructed from ``φ[K+1:K+5]`` and handed to
     ``prior_penalty`` so that a ``PriorConfig`` background prior (``bg_g_mean`` /
     ``bg_r_mean``) is differentiated here too.  Without that the posterior CRB would
     silently ignore the prior and report the far wider background-free bound.
 
-    With a ``prior`` this reproduces the target ``sample.build_log_prob`` uses (hence
-    HMC) exactly.  The Hessian is taken by autograd double-backward (the same machinery
+    With a ``prior`` this reproduces the MAP objective ``infer.fit`` optimises: the
+    prior penalty plus the gauge anchor, and NO prior on the photophysics rates.  Since
+    0.4.0 that is also exactly the sampler's target, so all three agree on one objective.
+    (An optional Gaussian prior on the four log-rates lived here until 0.4.0, to mirror
+    one the sampler used to add.  Both are gone: ``a_g``/``a_r`` are pinned by the photon
+    stream and the backgrounds by ``PriorConfig``'s Gamma, and every analysis had
+    switched the term off explicitly anyway -- precisely so the bound describes the
+    estimator that produced the MAP.)
+    The Hessian is taken by autograd double-backward (the same machinery
     ``_mean_hessian`` uses).  Most terms are quadratic in ``φ`` and so contribute a
     constant Hessian, but the **bg** term is a Gamma and is NOT — so this must be
     evaluated AT the MAP, not at any convenient nearby point.
@@ -384,7 +389,6 @@ def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
 
     from torch.func import functional_call
     module = _PriorModule(potential)
-    log_rates0 = phi_star[K + 1:K + 5].detach()
 
     def neg_log_penalty(phi):
         theta = phi[:K]
@@ -396,9 +400,6 @@ def _penalty_hessian(phi_star, potential, grid, prior, K, gauge_sd, rate_sd):
             rates_phi = EffectiveRates(r[0], r[1], r[2], r[3])
             out = out + functional_call(module, {"potential.theta": theta},
                                         args=(D, grid, prior, rates_phi))
-            if rate_sd is not None:
-                log_rates = phi[K + 1:K + 5]
-                out = out + 0.5 * (((log_rates - log_rates0) / rate_sd) ** 2).sum()
         if gauge_sd is not None:
             out = out + gauge_penalty_from_offset(
                 gauge_offset_from_theta(theta), gauge_sd)
@@ -422,7 +423,6 @@ def cramer_rao_bound(
     *,
     prior: "PriorConfig | None" = None,
     gauge_sd: "float | None" = 1.0,
-    rate_sd: "float | None" = 1.0,
     jitter: float = 1e-12,
     score_chunk: int = 32,
     propagate_dtype: "torch.dtype | None" = None,
@@ -441,9 +441,9 @@ def cramer_rao_bound(
     landscape functionals are untouched — the module docstring gives the exact identity.
 
     With ``prior=None`` (default) this is therefore the likelihood CRB in the anchored
-    gauge.  With a ``prior`` (the ``PriorConfig`` the fit used) the prior's Hessian and
-    the Gaussian rate prior are added as well, giving the **posterior information
-    matrix** — the analytic Laplace precision of that MAP objective.
+    gauge.  With a ``prior`` (the ``PriorConfig`` the fit used) the prior's Hessian is
+    added as well, giving the **posterior information matrix** — the analytic Laplace
+    precision of that MAP objective.
     ``cov``/``sigma`` are then the posterior covariance/σ, with the prior additionally
     regularising the soft edge-knot directions the anchor cannot reach.  Evaluate at a
     MAP (``dfl.fit`` output) for the Laplace interpretation; at the truth it is the
@@ -477,9 +477,6 @@ def cramer_rao_bound(
         ``None`` omits it and falls back to the pseudo-inverse of the bare Fisher, which
         warns: per-knot σ then become lower bounds in a thresholded null space, and
         ``null_dim`` changes meaning.  Only pass ``None`` deliberately.
-    rate_sd : float | None
-        Std of the Gaussian rate prior.  A belief about photophysics, so unlike
-        ``gauge_sd`` it opts in with the rest of the prior: ignored when ``prior is None``.
     validate : bool
         Also compute the observed information ``E[-H]`` and report the
         information-matrix-identity relative-Frobenius agreement (diagnostic).
@@ -537,7 +534,7 @@ def cramer_rao_bound(
     fisher = 0.5 * (fisher + fisher.T)
     fisher_per_trace = fisher / N
 
-    H = _penalty_hessian(phi, potential, grid, prior, K, gauge_sd, rate_sd)
+    H = _penalty_hessian(phi, potential, grid, prior, K, gauge_sd)
     if H is not None:
         # information = Fisher + gauge anchor (always) + prior Hessian (if any).
         # Normally positive definite, so invert it EXACTLY; `_psd_inverse` falls back to

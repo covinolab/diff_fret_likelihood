@@ -1,29 +1,3 @@
-"""FRET map and per-channel emission intensities (SPEC section 4.2).
-
-Matches the ``smFRET_sbi`` / ``diff_fret_photon`` forward model exactly so the
-likelihood is evaluated with the *same* photon model that generated the data:
-
-    E(x)  = R0^6 / (R0^6 + x^6)
-    phi_g = C_gg (1-E) + C_rg E,   phi_r = C_gr (1-E) + C_rr E
-    mu_G  = eta_g kD phi_g + beta_g = a_g phi_g + bg_g
-    mu_R  = eta_r kD phi_r + beta_r = a_r phi_r + bg_r
-
-matching ``simulator.pyx`` lines 380-381 exactly.  The backgrounds are DETECTED
-rates and are added *outside* the detector efficiency, on both sides -- the
-simulator takes ``beta_g``/``beta_r`` directly, so no conversion exists anywhere.
-The identifiable brightnesses are ``a_g = eta_g kD``, ``a_r = eta_r kD`` and the
-backgrounds are ``bg_g = beta_g``, ``bg_r = beta_r``.  The crosstalk matrix ``C``
-and ``R0`` are fixed calibration.  These four positive rates (a_g, a_r, bg_g,
-bg_r) are the emission parameters exposed to the optimiser; the mapping
-``mu = a phi + bg`` is fully general regardless of the eta/kD decomposition.
-
-``eta_c`` and ``kD`` never appear separately -- only the product ``a_c = eta_c kD``
-is identifiable, which is why ``from_physics`` takes both but stores one number
-per channel.
-
-Everything is vectorised over ``x`` (shape preserving); no per-photon loops.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
