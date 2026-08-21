@@ -411,3 +411,45 @@ def test_multi_chain_rhat():
     assert mc.idata is not None and mc.idata.posterior.sizes["chain"] == 2
     assert "r_hat" in mc.summary().columns
     assert mc.U.shape[0] == mc.chains[0].U.shape[0] + mc.chains[1].U.shape[0]
+
+
+def _multi(s, **kw):
+    pytest.importorskip("pyro")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return S.sample_posterior_multi(
+            s["batch"], s["grid"], s["pot"], s["C"], s["R0"], s["prior"], s["rates"],
+            num_chains=2, overdisperse=0.2, base_seed=0, kde_warmstart=False,
+            map_warmstart=False, D_init=10.0, num_samples=5, warmup=2,
+            num_steps_per_sample=2, step_size=0.01, sampler="hmc", verbose=False, **kw)
+
+
+def test_parallel_chains_match_sequential():
+    """``n_parallel`` is a scheduling choice, not a modelling one.
+
+    Each chain seeds its own RNG from ``base_seed + c`` and the MAP warm start is
+    deterministic, so which process a chain ran in must not change its draws. Compared with
+    a tolerance rather than exactly: the point is that the chains are the same, not that
+    two interpreters accumulate floats in identical order.
+    """
+    seq = _multi(_setup(), n_parallel=1)
+    par = _multi(_setup(), n_parallel=2)
+    assert len(par.chains) == len(seq.chains) == 2
+    for c, (a, b) in enumerate(zip(seq.chains, par.chains)):
+        assert torch.allclose(a.z, b.z, atol=1e-8), f"chain {c} z"
+        assert torch.allclose(a.U, b.U, atol=1e-8), f"chain {c} U"
+        assert torch.allclose(a.D, b.D, atol=1e-8), f"chain {c} D"
+
+
+def test_parallel_returns_the_same_shape_of_result():
+    """Same devices, same dtypes, same container -- and n_parallel clamps to num_chains."""
+    s = _setup()
+    seq, par = _multi(s, n_parallel=1), _multi(s, n_parallel=9)   # 9 -> clamped to 2
+    assert len(par.chains) == 2
+    for a, b in zip(seq.chains, par.chains):
+        for name in ("U", "D", "rates", "theta", "z", "grid"):
+            x, y = getattr(a, name), getattr(b, name)
+            assert x.shape == y.shape and x.dtype == y.dtype and x.device == y.device, name
+        assert a.n_sampled_rates == b.n_sampled_rates
+    if par.idata is not None:
+        assert par.idata.posterior.sizes["chain"] == 2

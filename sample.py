@@ -491,9 +491,22 @@ def _chains_to_arviz(chains):
     return az.from_dict(posterior=_posterior_dict(chains))
 
 
+def _run_one_chain(payload):
+    """One chain, from a picklable payload -- the unit ``n_parallel`` fans out over.
+
+    Module level so ``spawn`` can pickle it by reference; the whole payload (a CUDA
+    ``potential``, ``grid``, ``C`` and the returned draws) survives the round trip in both
+    directions on the same device, so nothing needs marshalling to the CPU and back.
+    """
+    batch, grid, potential, C, R0, prior, rates_init, seed, jitter, verbose, kwargs = payload
+    return sample_posterior(batch, grid, potential, C, R0, prior, rates_init,
+                            kde_warmstart=False, seed=seed, init_jitter=jitter,
+                            verbose=verbose, **kwargs)
+
+
 def sample_posterior_multi(
     batch, grid, potential, C, R0, prior: PriorConfig | None, rates_init=None, *,
-    num_chains=4, overdisperse=0.3, base_seed=0, verbose=True, **kwargs,
+    num_chains=4, overdisperse=0.3, base_seed=0, n_parallel=1, verbose=True, **kwargs,
 ) -> MultiChainPosterior:
     """Run ``num_chains`` chains from over-dispersed starts for R-hat / ESS.
 
@@ -501,11 +514,22 @@ def sample_posterior_multi(
     ``potential``, a distinct ``seed = base_seed + c``, and an ``init_jitter =
     overdisperse`` perturbation of its start, so R-hat is not flattered by every chain
     sharing one starting point.  Extra ``kwargs`` pass through to ``sample_posterior``.
-    Chains run sequentially.
 
     The KDE warm start runs **once**, here, on the template potential -- the per-chain
     copies inherit it.  Left to ``sample_posterior`` it would repeat its bin-width scan
     (a full likelihood pass per candidate) for every chain.
+
+    ``n_parallel`` (default 1, i.e. sequential) runs that many chains at once in ``spawn``
+    worker processes.  On one GPU this is worth roughly **1.4x**, not ``n_parallel``-fold:
+    measured on an A6000 the device sits at 64-70% utilisation, and the idle time is
+    Python-side work between kernel launches.  Threads therefore do not help at all (0.9x,
+    the GIL serialises exactly the gap being targeted) while separate interpreters do
+    (1.42x at two workers), but 64% utilisation caps the total near 1.56x.
+
+    The cost to weigh against it: every worker is a fresh interpreter and **re-compiles the
+    likelihood**, measured at 12-23 s, so a short chain finishes *slower* in parallel than
+    it would sequentially.  Point ``TORCHINDUCTOR_CACHE_DIR`` at a shared directory and
+    later workers hit the on-disk cache instead of compiling again.
     """
     kwargs.pop("init_jitter", None)   # controlled here via ``overdisperse``
     kwargs.pop("seed", None)
@@ -523,16 +547,33 @@ def sample_posterior_multi(
     if kwargs.get("D_init") is None and D_kde is not None:
         kwargs["D_init"] = D_kde
 
-    chains = []
-    for c in range(num_chains):
+    n_parallel = max(1, min(int(n_parallel), num_chains))
+    # Interleaved pyro progress bars are unreadable, so the workers stay quiet and the
+    # parent reports one line per chain instead.
+    payloads = [(batch, grid, copy.deepcopy(potential), C, R0, prior, rates_init,
+                 base_seed + c, overdisperse, verbose and n_parallel == 1, kwargs)
+                for c in range(num_chains)]
+
+    if n_parallel > 1:
+        import multiprocessing as mp
         if verbose:
-            print(f"[multi-chain] chain {c + 1}/{num_chains} (seed={base_seed + c})")
-        ps = sample_posterior(
-            batch, grid, copy.deepcopy(potential), C, R0, prior, rates_init,
-            kde_warmstart=False, seed=base_seed + c, init_jitter=overdisperse,
-            verbose=verbose, **kwargs,
-        )
-        chains.append(ps)
+            print(f"[multi-chain] {num_chains} chains on {n_parallel} workers")
+        # spawn, not fork: a forked process cannot inherit a CUDA context.  Plain
+        # multiprocessing rather than torch.multiprocessing, whose reductions hand tensors
+        # over by CUDA IPC -- that would tie the returned draws to a worker that has exited.
+        chains = []
+        with mp.get_context("spawn").Pool(n_parallel) as pool:
+            for c, ps in enumerate(pool.imap(_run_one_chain, payloads)):  # order preserved
+                if verbose:
+                    print(f"[multi-chain] chain {c + 1}/{num_chains} done "
+                          f"(seed={base_seed + c})")
+                chains.append(ps)
+    else:
+        chains = []
+        for c, p in enumerate(payloads):
+            if verbose:
+                print(f"[multi-chain] chain {c + 1}/{num_chains} (seed={base_seed + c})")
+            chains.append(_run_one_chain(p))
 
     idata = None
     try:
