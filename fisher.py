@@ -153,7 +153,7 @@ def _knot_basis(potential, grid):
             "cramer_rao_bound requires a SplinePotential (a landscape linear in "
             f"its knot heights); got {type(potential).__name__}. The whole scoring "
             "parameterisation below is the knot vector, so a potential without a "
-            "knot basis has no dense CRB here."
+            "knot basis (FixedPotential, ParametricPotential) has no dense CRB here."
         )
     B = potential._basis(grid)                           # on_grid = B @ theta
     b0 = torch.zeros(grid.shape[0], dtype=B.dtype, device=B.device)

@@ -12,16 +12,13 @@ from .photophysics import EffectiveRates
 def warmstart_potential(potential, grid: torch.Tensor, u_target):
     """Set ``potential`` so ``potential.on_grid(grid) ~= u_target`` (in place).
 
-    One least-squares solve: the spline is linear in its knot heights, so this is
-    the exact projection of ``u_target`` onto the knot basis, not an iterative fit.
-    Returns the (mutated) potential.
+    Delegates to ``potential.project(grid, u_target)`` (the ``Potential`` contract).
+    For the spline that is one least-squares solve: it is linear in its knot heights, so
+    this is the exact projection of ``u_target`` onto the knot basis, not an iterative
+    fit.  Landscapes without a projection (``FixedPotential``, ``ParametricPotential``)
+    raise ``NotImplementedError``.  Returns the (mutated) potential.
     """
-    u_target = torch.as_tensor(u_target, dtype=DTYPE, device=grid.device).reshape(-1).detach()
-    M = potential._basis(grid)                                # [G, n_knots]
-    sol = torch.linalg.lstsq(M, u_target.unsqueeze(1)).solution.reshape(-1)
-    with torch.no_grad():
-        potential.theta.copy_(sol)
-    return potential
+    return potential.project(grid, u_target)
 
 
 def estimate_rates(batch, *, bg_frac=0.10, bg_g=None, bg_r=None, device=None):

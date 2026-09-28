@@ -65,6 +65,19 @@ RATE_NAMES = ("a_g", "a_r", "bg_g", "bg_r")
 # --------------------------------------------------------------------------- #
 # flat <-> structured parameter helpers
 # --------------------------------------------------------------------------- #
+def _require_spline(potential, where):
+    """The flat vector is ``[theta | logD | log rates]`` and the gauge anchor is
+    ``mean(theta)``: spline-only.  Refuse anything else up front -- before the warm
+    start can touch the potential and before ``torch.cat`` trips over an empty
+    parameter list."""
+    if not hasattr(potential, "_basis"):
+        raise NotImplementedError(
+            f"{where} supports SplinePotential only (its parameter vector is the knot "
+            f"heights and its gauge anchor mean(theta)); got {type(potential).__name__}. "
+            "FixedPotential / ParametricPotential landscapes have no sampler yet."
+        )
+
+
 def _param_specs(potential):
     """[(name, shape, numel)] for the potential's learnable parameters."""
     return [(n, tuple(p.shape), p.numel()) for n, p in potential.named_parameters()]
@@ -159,6 +172,7 @@ def build_log_prob(
     ``sample_bg=False`` freezes ``bg_g``/``bg_r`` at their ``rates_init`` values and drops
     them from ``z``, mirroring ``infer.fit(fit_bg=False)``.
     """
+    _require_spline(potential, "build_log_prob")
     _warn_about_prior(prior)
 
     specs = _param_specs(potential)
@@ -356,6 +370,7 @@ def sample_posterior(
 
     Returns ``PosteriorSamples`` (S = number of post-warmup draws).
     """
+    _require_spline(potential, "sample_posterior")
     import pyro
     from pyro.infer import HMC, MCMC, NUTS
 
@@ -531,6 +546,7 @@ def sample_posterior_multi(
     it would sequentially.  Point ``TORCHINDUCTOR_CACHE_DIR`` at a shared directory and
     later workers hit the on-disk cache instead of compiling again.
     """
+    _require_spline(potential, "sample_posterior_multi")
     kwargs.pop("init_jitter", None)   # controlled here via ``overdisperse``
     kwargs.pop("seed", None)
 
