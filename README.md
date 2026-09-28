@@ -350,6 +350,61 @@ Things worth knowing before you trust a band:
   sampling them. `fit_rates` is a warm-start knob only — the chain always samples
   the brightnesses, since marginalising over the photophysics is the point.
 
+## Other landscapes: fixed and parametric
+
+`dfl.fit` optimises whatever parameters the landscape *emits*: the kind of landscape
+is decided by the object you pass, not by a flag. Three kinds ship, all implementing
+the small `dfl.Potential` contract.
+
+**`SplinePotential`** is what Examples 1–3 use: natural-cubic knot heights, all free.
+Build it with `dfl.build_potential(cfg, grid)`, which derives the knot window from the
+grid's extent; the constructor itself takes only the `PotentialConfig`. The grid is
+never a property of a landscape — every kind receives it at evaluation time, in
+`on_grid(grid)`.
+
+**`FixedPotential(fn)`** wraps any torch callable `u(x)` and is never optimised: it
+has no parameters, so the fit moves only `D` and the photophysics. A fitted spline is
+a callable, which gives the idiom for "hold the landscape I just fitted and refit `D`
+on another dataset":
+
+```python
+fixed = dfl.FixedPotential(res.potential)             # the spline from Example 1
+res2 = dfl.fit(batch2, grid, fixed,
+               C=consts.crosstalk_tensor(), R0=consts.R0,
+               D_init=5.0, rates_init=rates, prior=None,
+               fit_D=True, fit_rates=True)
+```
+
+A closed form works the same way: `dfl.FixedPotential(lambda x: 0.5 * (x - 6.0) ** 2)`.
+
+**`ParametricPotential(fn, params, positive=(), gauge_param=None)`** is a closed form
+with named parameters, all free. Names listed in `positive` are log-parametrised so
+they stay positive through the fit; `gauge_param` names an additive constant, if the
+form has one, so the fit can anchor that flat direction the way it anchors the
+spline's offset:
+
+```python
+def harmonic(x, x0, k):
+    return 0.5 * k * (x - x0) ** 2
+
+pot = dfl.ParametricPotential(harmonic, dict(x0=6.0, k=2.0), positive=("k",))
+res = dfl.fit(batch, grid, pot,
+              C=consts.crosstalk_tensor(), R0=consts.R0,
+              D_init=5.0, rates_init=rates, prior=None)
+print(res.potential.physical())                       # {'x0': tensor(..), 'k': tensor(..)}
+```
+
+Two things follow from "no knots". `PriorConfig.curvature_weight` must be `0` (or
+`prior=None`) for these landscapes: the curvature prior is defined on knot heights and
+raises rather than silently vanishing. And `dfl.recovered_potential` returns them
+unshifted, because their offset is part of the model rather than a convention (the
+spline's is a convention, and is still reported grid-mean-zero). The Cramér–Rao bound
+and the sampler remain spline-only for now and say so when handed anything else.
+
+To write your own parametrisation, subclass `dfl.Potential` and implement
+`on_grid(grid) -> [G]`; the optional hooks (`forward`, `force`, `gauge_offset`,
+`curvature_penalty`, `project`) are documented on the class.
+
 ## Tests
 
 ```bash

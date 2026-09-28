@@ -104,12 +104,14 @@ def gauge_offset_from_theta(theta: torch.Tensor) -> torch.Tensor:
 def gauge_offset(potential, grid: torch.Tensor) -> torch.Tensor:
     """The pure-gauge offset coordinate of ``U``, from a potential object.
 
-    A thin wrapper over ``gauge_offset_from_theta``: with the spline the only
-    parameterisation, ``mean(theta)`` *is* the exact flat direction, so anchoring it
-    costs nothing on the identified shape.  ``grid`` is unused and kept only because
-    it is part of the signature every caller already passes.
+    Delegates to ``potential.gauge_offset(grid)`` (the ``Potential`` contract).  For the
+    spline that is ``gauge_offset_from_theta(theta) = mean(theta)``, the exact flat
+    direction, so anchoring it costs nothing on the identified shape.  A landscape whose
+    offset is physical (``FixedPotential``; a ``ParametricPotential`` without a
+    ``gauge_param``) returns an exact zero on ``grid``'s dtype/device, so the anchor
+    vanishes identically.
     """
-    return gauge_offset_from_theta(potential.theta)
+    return potential.gauge_offset(grid)
 
 
 def gauge_penalty_from_offset(offset: torch.Tensor, gauge_sd: float = 1.0) -> torch.Tensor:
@@ -150,8 +152,10 @@ def prior_penalty(potential, D, grid: torch.Tensor, prior: PriorConfig | None,
 
     reg = _scalar_zero(grid)
     if prior.curvature_weight:
-        reg = reg + prior.curvature_weight * curvature_penalty_spline(
-            potential.theta, potential.knots_x,
+        # ``Potential.curvature_penalty``: the spline's second differences of the knot
+        # heights (``curvature_penalty_spline``); a landscape without knots raises, so a
+        # curvature weight can never be silently ignored.
+        reg = reg + prior.curvature_weight * potential.curvature_penalty(
             norm=getattr(prior, "curvature_norm", "l2"),
         )
     if prior.bg_g_mean is not None or prior.bg_r_mean is not None:

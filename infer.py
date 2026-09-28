@@ -64,6 +64,17 @@ class FitResult:
     free_rates: object = None
 
 
+def _require_free_params(params, where):
+    """A landscape that emits no parameters (``FixedPotential``) plus ``fit_D=False``
+    and ``fit_rates=False`` leaves LBFGS nothing to do; say so instead of letting the
+    optimiser complain about an empty parameter list."""
+    if not params:
+        raise ValueError(
+            f"{where}: nothing to optimise -- the potential emits no parameters (a fixed "
+            "landscape) and fit_D / fit_rates are both False."
+        )
+
+
 def _lbfgs_fit(params, closure_value, optim, verbose, d_of):
     """Guarded LBFGS driver shared by ``fit``/``fit_multi``.
 
@@ -203,6 +214,7 @@ def fit(
         params.append(log_D)
     if fit_rates:
         params += list(free_rates.parameters())
+    _require_free_params(params, "fit")
 
     compile_mode = optim.compile_mode if optim.compile else None
 
@@ -313,6 +325,7 @@ def fit_multi(
     if fit_rates:
         for fr in free_rates_list:
             params += list(fr.parameters())
+    _require_free_params(params, "fit_multi")
 
     compile_mode = optim.compile_mode if optim.compile else None
 
@@ -370,6 +383,12 @@ def recovered_potential(potential, grid) -> torch.Tensor:
     It differs from the fit/CRB enforcement gauge (``mean(theta)=0``) only by a
     constant.  (The min-subtraction in ``_BasePotential_on_grid`` is an *internal*
     exp-overflow safeguard for the likelihood, deliberately not used for reporting.)
+
+    Landscapes whose offset is part of the model (``gauge_free = False``: a
+    ``FixedPotential``, a ``ParametricPotential`` without a ``gauge_param``) are returned
+    as they are -- their offset is physics, not a convention to remove.
     """
     u = potential.on_grid(grid)
+    if not getattr(potential, "gauge_free", True):
+        return u
     return u - u.mean()
