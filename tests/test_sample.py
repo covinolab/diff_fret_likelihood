@@ -453,3 +453,112 @@ def test_parallel_returns_the_same_shape_of_result():
         assert a.n_sampled_rates == b.n_sampled_rates
     if par.idata is not None:
         assert par.idata.posterior.sizes["chain"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# mass matrix: a starting matrix, the single-window schedule, diagnostics
+# --------------------------------------------------------------------------- #
+def _dim(s):
+    return s["pot"].theta.numel() + 1 + S.N_RATES
+
+
+def _seed_matrix(s, sd=0.3):
+    """A dense, well-conditioned SPD matrix in z order (stand-in for a posterior CRB)."""
+    d = _dim(s)
+    A = torch.randn(d, d, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+    return sd ** 2 * (A @ A.T / d + torch.eye(d, dtype=torch.float64))
+
+
+def _seeded_chain(s, **kw):
+    pytest.importorskip("pyro")
+    opts = dict(kde_warmstart=False, map_warmstart=False, D_init=10.0, num_samples=4,
+                warmup=2, num_steps_per_sample=2, step_size=0.002, sampler="hmc",
+                verbose=False)
+    opts.update(kw)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return S.sample_posterior(s["batch"], s["grid"], s["pot"], s["C"], s["R0"],
+                                  s["prior"], s["rates"], **opts)
+
+
+def test_single_window_schedule_bounds():
+    pytest.importorskip("pyro")
+    spans = lambda w: [(x.start, x.end) for x in S._single_window_schedule(w)]
+    assert spans(300) == [(0, 74), (75, 249), (250, 299)]
+    assert spans(40) == [(0, 5), (6, 35), (36, 39)]       # short warmup: 15 % / 10 % buffers
+    assert S._single_window_schedule(10) is None           # pyro adapts no matrix below 20
+
+
+def test_starting_matrix_is_kept_when_not_adapted():
+    s = _setup()
+    M = _seed_matrix(s)
+    ps = _seeded_chain(s, inverse_mass_matrix=M, adapt_mass=False, warmup=40)
+    assert torch.allclose(ps.inverse_mass_matrix, M, atol=1e-12)
+
+
+def test_starting_matrix_is_replaced_once_by_the_single_window():
+    s = _setup()
+    M = _seed_matrix(s)
+    ps = _seeded_chain(s, inverse_mass_matrix=M, mass_schedule="single", warmup=40)
+    assert ps.inverse_mass_matrix.shape == M.shape
+    assert not torch.allclose(ps.inverse_mass_matrix, M)
+
+
+def test_bad_mass_settings_raise_before_any_work():
+    s = _setup()
+    with pytest.raises(ValueError, match="shape"):
+        _seeded_chain(s, inverse_mass_matrix=torch.eye(3, dtype=torch.float64))
+    with pytest.raises(ValueError, match="mass_schedule"):
+        _seeded_chain(s, mass_schedule="windows")
+    with pytest.raises(ValueError, match="positive definite"):
+        _seeded_chain(s, inverse_mass_matrix=-torch.eye(_dim(s), dtype=torch.float64))
+
+
+def test_jitter_is_in_units_of_the_starting_sigma():
+    z0 = torch.zeros(5, dtype=torch.float64)
+    scale = torch.tensor([1e-3, 1.0, 1.0, 1.0, 1.0], dtype=torch.float64)
+    iso = S._jittered_start(z0, 1.0, seed=3)
+    scaled = S._jittered_start(z0, 1.0, seed=3, scale=scale)
+    assert torch.allclose(scaled, iso * scale)               # same noise, rescaled
+    assert abs(float(scaled[0])) < 0.01
+    g = torch.Generator(device="cpu").manual_seed(3)          # the historical formula
+    assert torch.equal(iso, z0 + torch.randn(5, generator=g, dtype=torch.float64))
+    assert torch.equal(S._jittered_start(z0, 0.0, seed=3), z0)
+
+
+def test_chain_reports_its_diagnostics():
+    s = _setup()
+    ps = _seeded_chain(s, warmup=5, num_samples=6)
+    assert ps.n_grad_warmup > 0 and ps.n_grad_sample >= 6
+    assert 0.0 <= ps.accept_rate <= 1.0
+    assert ps.n_divergences >= 0 and ps.step_size > 0
+    assert ps.inverse_mass_matrix.shape == (_dim(s), _dim(s))
+
+
+def test_nuts_gradients_per_draw_respect_the_depth_cap():
+    s = _setup()
+    ps = _seeded_chain(s, sampler="nuts", max_tree_depth=2, warmup=5, num_samples=4)
+    assert 4 <= ps.n_grad_sample <= 4 * (2 ** 2 - 1)
+    assert 0.0 <= ps.accept_rate < 1.0       # mean acceptance probability, not "moved"
+
+
+def test_fixed_step_size_is_kept():
+    s = _setup()
+    ps = _seeded_chain(s, sampler="nuts", max_tree_depth=2, warmup=0, num_samples=3,
+                       step_size=0.0123, adapt_step_size=False)
+    assert ps.step_size == 0.0123 and ps.z.shape[0] == 3
+
+
+def test_explicit_defaults_change_nothing():
+    a = _seeded_chain(_setup(), warmup=5, seed=4)
+    b = _seeded_chain(_setup(), warmup=5, seed=4, inverse_mass_matrix=None,
+                      mass_schedule="stan", adapt_mass=True)
+    assert torch.equal(a.z, b.z)
+
+
+def test_multi_chain_passes_the_starting_matrix_through():
+    s = _setup()
+    M = _seed_matrix(s)
+    mc = _multi(s, n_parallel=1, inverse_mass_matrix=M, adapt_mass=False)
+    for ps in mc.chains:
+        assert torch.allclose(ps.inverse_mass_matrix, M, atol=1e-12)

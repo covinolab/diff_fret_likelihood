@@ -114,6 +114,101 @@ def _flatten_init(potential, D_init, rates_init, *, device=None, sample_bg=True)
 
 
 # --------------------------------------------------------------------------- #
+# mass matrix: a starting matrix and the adaptation schedule
+# --------------------------------------------------------------------------- #
+MASS_SCHEDULES = ("stan", "single")
+
+
+def _single_window_schedule(warmup_steps):
+    """pyro's warmup schedule with ONE mass-matrix window (``mass_schedule="single"``).
+
+    Same start and end buffers as pyro's default (75 and 50 steps, or 15 % / 10 % of a
+    short warmup), but the doubling slow windows in between are merged into one, so the
+    matrix is replaced exactly once, by the covariance of everything drawn in between.
+    ``None`` below 20 warmup steps, where pyro adapts no mass matrix at all.
+    """
+    from pyro.infer.mcmc.adaptation import adapt_window
+
+    W = int(warmup_steps)
+    if W < 20:
+        return None
+    start, end = 75, 50
+    if start + end + 25 > W:                     # pyro's own rule for short warmups
+        start, end = int(0.15 * W), int(0.1 * W)
+    return [adapt_window(0, start - 1), adapt_window(start, W - end - 1),
+            adapt_window(W - end, W - 1)]
+
+
+def _prepare_inverse_mass_matrix(M, dim, full_mass, device):
+    """Validate a starting inverse mass matrix and bring it to the kernel's layout.
+
+    Accepts ``[dim, dim]`` or a ``[dim]`` vector of variances, in z order. A dense kernel
+    gets the symmetrised matrix (a vector becomes its diagonal), a diagonal kernel gets the
+    diagonal. pyro takes a Cholesky factor, so a matrix that fails only by round-off gets a
+    relative diagonal jitter of at most 1e-8; anything worse raises.
+    """
+    M = torch.as_tensor(M, dtype=DTYPE, device=device)
+    if tuple(M.shape) not in ((dim,), (dim, dim)):
+        raise ValueError(f"inverse_mass_matrix must have shape ({dim},) or ({dim}, {dim}), in "
+                         f"z order [theta | logD | log rates]; got {tuple(M.shape)}")
+    if not full_mass:
+        diag = (M if M.ndim == 1 else torch.diagonal(M)).clone()
+        if not (diag > 0).all():
+            raise ValueError("inverse_mass_matrix: the variances must be positive")
+        return diag
+    M = torch.diag(M) if M.ndim == 1 else 0.5 * (M + M.T)
+    eye = torch.eye(dim, dtype=DTYPE, device=device)
+    scale = float(torch.diagonal(M).abs().mean())
+    for rel in (0.0, 1e-12, 1e-10, 1e-8):
+        Mj = M + rel * scale * eye
+        if int(torch.linalg.cholesky_ex(Mj).info) == 0:
+            return Mj
+    raise ValueError("inverse_mass_matrix is not positive definite")
+
+
+def _kernel_class(base, inverse_mass_matrix, mass_schedule):
+    """``base`` (pyro's NUTS or HMC) itself, or a subclass that installs the starting
+    inverse mass matrix and/or the single-window schedule right after pyro's ``setup``.
+
+    pyro builds the identity matrix and its windowed schedule inside ``setup``, so anything
+    set earlier is overwritten. After the swap the step size is searched again, under the
+    new metric. With the defaults this returns ``base`` unchanged.
+    """
+    if inverse_mass_matrix is None and mass_schedule == "stan":
+        return base
+
+    class _Seeded(base):
+        def setup(self, warmup_steps, *args, **kwargs):
+            super().setup(warmup_steps, *args, **kwargs)
+            adapter = self._adapter
+            if inverse_mass_matrix is not None:
+                (key,) = tuple(self.mass_matrix_adapter.inverse_mass_matrix)   # ("z",)
+                self.mass_matrix_adapter.inverse_mass_matrix = {key: inverse_mass_matrix}
+            if mass_schedule == "single" and adapter.adapt_mass_matrix:
+                schedule = _single_window_schedule(warmup_steps)
+                if schedule is not None:
+                    adapter._adaptation_schedule = schedule
+                    adapter._current_window = 0
+            if adapter.adapt_step_size:
+                adapter.reset_step_size_adaptation(self._initial_params)
+
+    return _Seeded
+
+
+def _jittered_start(z0, init_jitter, seed, scale=None):
+    """``z0`` plus ``init_jitter`` times standard-normal noise from a CPU generator seeded
+    with ``seed``: per coordinate in units of ``scale`` (the starting matrix's
+    sqrt-diagonal) when given, isotropic in z otherwise (the historical behaviour)."""
+    if not init_jitter or init_jitter <= 0:
+        return z0
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    noise = torch.randn(z0.numel(), generator=g, dtype=DTYPE).to(z0.device)
+    if scale is not None:
+        noise = noise * scale.to(z0.device)
+    return z0 + init_jitter * noise
+
+
+# --------------------------------------------------------------------------- #
 # log-posterior as a function of the flat vector
 # --------------------------------------------------------------------------- #
 class _NLPModule(torch.nn.Module):
@@ -227,6 +322,13 @@ class PosteriorSamples:
     z: torch.Tensor       # [S, dim] raw unconstrained draws
     grid: torch.Tensor    # [G]
     n_sampled_rates: int = N_RATES   # 2 when the backgrounds were held fixed
+    # sampler diagnostics; None where unavailable (the counts with jit_compile=True)
+    n_grad_warmup: int | None = None    # potential evaluations in warmup, incl. setup
+    n_grad_sample: int | None = None    # ... while drawing: / S = the cost of one draw
+    accept_rate: float | None = None    # mean acceptance probability of the draws
+    n_divergences: int | None = None
+    step_size: float | None = None
+    inverse_mass_matrix: torch.Tensor | None = None   # final; [dim, dim], [dim] if diagonal
 
     def U_mean(self) -> torch.Tensor:
         return self.U.mean(0)
@@ -331,7 +433,8 @@ def sample_posterior(
     map_warmstart=True, map_optim=None, fit_rates=True, fit_bg=True, D_init=None,
     sampler="nuts", num_samples=1000, warmup=200, step_size=0.01, target_accept=0.8,
     full_mass=True, max_tree_depth=10, num_steps_per_sample=20, seed=0, init_jitter=0.0,
-    gauge_sd=1.0, p0=None,
+    gauge_sd=1.0, p0=None, inverse_mass_matrix=None, mass_schedule="stan", adapt_mass=True,
+    adapt_step_size=True,
     compile_mode=None, propagate_dtype=None, jit_compile=False, verbose=True,
 ) -> PosteriorSamples:
     """Draw from the posterior over U(x), D and the emission rates with pyro HMC/NUTS.
@@ -368,9 +471,36 @@ def sample_posterior(
     ``bg_g``/``bg_r`` at ``rates_init`` in the fit *and* drops them from ``z`` -- because a
     separately calibrated background is a measurement to keep, not a parameter to infer.
 
+    **Mass matrix.**  By default pyro starts from the identity and learns a dense matrix in
+    doubling windows (25, 50, 100, ... steps after a 75-step buffer), each replacing the
+    last; with posterior widths that differ by orders of magnitude it learns slowly and
+    trees run into ``max_tree_depth``.  ``inverse_mass_matrix`` (``[dim, dim]`` or
+    ``[dim]``, z order) starts it from a known covariance instead; the posterior CRB
+    (``cramer_rao_bound(..., prior=prior)``, same prior, same gauge anchor, same order) is
+    the natural choice.  ``mass_schedule="single"`` merges the slow windows into one, so a
+    good start is not thrown away after 25 draws but replaced once, by the covariance of
+    everything sampled until the 50-step end buffer.  ``adapt_mass=False`` keeps the
+    starting matrix and adapts only the step size.  A slow direction is under-estimated by
+    correlated warmup draws, so compare the final ``inverse_mass_matrix`` with the start.
+    With a starting matrix, ``init_jitter`` is in units of its sqrt-diagonal.
+
+    **Continuing a chain.**  ``adapt_step_size=False`` keeps ``step_size`` as given (no
+    search, no dual averaging).  With ``warmup=0``, ``init_jitter=0``, ``adapt_mass=False``,
+    a chain's final ``step_size`` and ``inverse_mass_matrix`` and its last draw as the start
+    (``potential``'s knots, ``D_init``, ``rates_init``), this continues that chain with the
+    same kernel; only the random-number stream is new.
+
+    **Diagnostics.**  The draws carry the number of potential evaluations in warmup and in
+    sampling (each one value + gradient, bar a few step-size searches), the mean acceptance
+    probability of the draws (the statistic ``target_accept`` tunes; pyro's own "acceptance
+    rate" counts the NUTS iterations that moved, which is ~1 whatever the step size), the
+    number of divergences, the final step size and the final inverse mass matrix.
+
     Returns ``PosteriorSamples`` (S = number of post-warmup draws).
     """
     _require_spline(potential, "sample_posterior")
+    if mass_schedule not in MASS_SCHEDULES:
+        raise ValueError(f"mass_schedule must be one of {MASS_SCHEDULES}, got {mass_schedule!r}")
     import pyro
     from pyro.infer import HMC, MCMC, NUTS
 
@@ -380,6 +510,10 @@ def sample_posterior(
     # all agree.
     batch = batch.to(device)
     C = C.to(device)
+    M0 = None
+    if inverse_mass_matrix is not None:      # checked before the (expensive) warm starts
+        dim = sum(p.numel() for p in potential.parameters()) + 1 + (N_RATES if fit_bg else 2)
+        M0 = _prepare_inverse_mass_matrix(inverse_mass_matrix, dim, full_mass, device)
 
     rates_init, D_kde = _warm_start(
         batch, grid, potential, C, R0, prior, rates_init, physics=physics,
@@ -414,29 +548,43 @@ def sample_posterior(
 
     pyro.set_rng_seed(int(seed))
 
-    if init_jitter and init_jitter > 0:
-        g = torch.Generator(device="cpu").manual_seed(int(seed))
-        noise = torch.randn(z0.numel(), generator=g, dtype=DTYPE).to(device)
-        z0 = z0 + init_jitter * noise
+    jitter_scale = None if M0 is None else (M0 if M0.ndim == 1 else torch.diagonal(M0)).sqrt()
+    z0 = _jittered_start(z0, init_jitter, seed, jitter_scale)
 
     # pyro minimises the potential ENERGY, so the potential_fn is -log_prob. The whole
     # flat vector lives under one site name ("z"); draws come back keyed by it.
+    # Every evaluation is counted (each one value + gradient, bar the few step-size
+    # searches) and split at the warmup/sampling boundary by pyro's hook, which also reads
+    # the kernel's diagnostics at the last draw, before pyro's cleanup resets them.
+    stats = {"n": 0, "n_warmup": 0, "diag": None, "accept": None}
+
     def potential_fn(params):
+        stats["n"] += 1
         return -log_prob_func(params["z"])
 
+    def hook(kernel, params, stage, i):
+        if stage.startswith("Warmup"):
+            stats["n_warmup"] = stats["n"]
+        elif i == int(num_samples) - 1:
+            stats["diag"] = kernel.diagnostics()
+            stats["accept"] = kernel._mean_accept_prob     # running mean over the draws
+
     kernel_kw = dict(
-        potential_fn=potential_fn, step_size=step_size, adapt_step_size=True,
-        adapt_mass_matrix=True, full_mass=full_mass,
+        potential_fn=potential_fn, step_size=step_size, adapt_step_size=bool(adapt_step_size),
+        adapt_mass_matrix=bool(adapt_mass), full_mass=full_mass,
         target_accept_prob=target_accept, jit_compile=jit_compile,
     )
-    if sampler.lower() == "nuts":
-        kernel = NUTS(max_tree_depth=int(max_tree_depth), **kernel_kw)
+    base = NUTS if sampler.lower() == "nuts" else HMC
+    Kernel = _kernel_class(base, M0, mass_schedule)
+    if base is NUTS:
+        kernel = Kernel(max_tree_depth=int(max_tree_depth), **kernel_kw)
     else:
-        kernel = HMC(num_steps=int(num_steps_per_sample), **kernel_kw)
+        kernel = Kernel(num_steps=int(num_steps_per_sample), **kernel_kw)
 
     mcmc = MCMC(
         kernel, num_samples=int(num_samples), warmup_steps=int(warmup),
         num_chains=1, initial_params={"z": z0}, disable_progbar=not verbose,
+        hook_fn=hook,
     )
     mcmc.run()
 
@@ -458,8 +606,18 @@ def sample_posterior(
                           dtype=rates.dtype, device=rates.device)
         rates = torch.cat([rates, bg.expand(rates.shape[0], 2)], dim=1)
 
-    return PosteriorSamples(U=U, D=D, rates=rates, theta=theta, z=Z, grid=grid,
-                            n_sampled_rates=n_rates)
+    diag = stats["diag"] or {}
+    M_final = kernel.inverse_mass_matrix               # the adapter survives pyro's cleanup
+    M_final = next(iter(M_final.values())).detach().to(device) if M_final else None
+    counted = not jit_compile                          # a traced potential is called once
+    return PosteriorSamples(
+        U=U, D=D, rates=rates, theta=theta, z=Z, grid=grid, n_sampled_rates=n_rates,
+        n_grad_warmup=stats["n_warmup"] if counted else None,
+        n_grad_sample=stats["n"] - stats["n_warmup"] if counted else None,
+        accept_rate=None if stats["accept"] is None else float(stats["accept"]),
+        n_divergences=len(diag["divergences"]) if "divergences" in diag else None,
+        step_size=float(kernel.step_size), inverse_mass_matrix=M_final,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -527,8 +685,10 @@ def sample_posterior_multi(
 
     A single chain gives R-hat = NaN (arviz needs >= 2).  Each chain gets a deep-copied
     ``potential``, a distinct ``seed = base_seed + c``, and an ``init_jitter =
-    overdisperse`` perturbation of its start, so R-hat is not flattered by every chain
-    sharing one starting point.  Extra ``kwargs`` pass through to ``sample_posterior``.
+    overdisperse`` perturbation of its start (in units of the starting matrix's
+    sqrt-diagonal when ``inverse_mass_matrix`` is passed), so R-hat is not flattered by
+    every chain sharing one starting point.  Extra ``kwargs`` pass through to
+    ``sample_posterior``.
 
     The KDE warm start runs **once**, here, on the template potential -- the per-chain
     copies inherit it.  Left to ``sample_posterior`` it would repeat its bin-width scan
