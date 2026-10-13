@@ -89,14 +89,14 @@ def doob_tpt(
     cdef double Ug, Umax, w_prev, w_curr
     gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Umax)
     for j in range(1, N_grid):
-        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dxg, acc, &Ug)
+        gsl_utils.gsl_spline_eval_e(spline, min(x_lo + j * dxg, x_hi), acc, &Ug)
         if Ug > Umax:
             Umax = Ug
     C[0] = 0.0
     gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Ug)
     w_prev = exp(Ug - Umax)
     for j in range(1, N_grid):
-        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dxg, acc, &Ug)
+        gsl_utils.gsl_spline_eval_e(spline, min(x_lo + j * dxg, x_hi), acc, &Ug)
         w_curr = exp(Ug - Umax)
         C[j] = C[j - 1] + 0.5 * (w_prev + w_curr) * dxg
         w_prev = w_curr

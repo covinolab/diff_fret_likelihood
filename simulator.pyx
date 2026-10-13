@@ -36,7 +36,7 @@ cdef double draw_boltzmann_x0(
     # min of U (log-sum-exp shift so exp() stays finite in deep wells)
     gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Umin)
     for j in range(1, N_grid):
-        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        gsl_utils.gsl_spline_eval_e(spline, min(x_lo + j * dx, x_knots[N - 1]), acc, &Ug)
         if Ug < Umin:
             Umin = Ug
 
@@ -44,7 +44,7 @@ cdef double draw_boltzmann_x0(
     gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Ug)
     w_prev = exp(-(Ug - Umin))
     for j in range(1, N_grid):
-        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        gsl_utils.gsl_spline_eval_e(spline, min(x_lo + j * dx, x_knots[N - 1]), acc, &Ug)
         w_curr = exp(-(Ug - Umin))
         Z += 0.5 * (w_prev + w_curr) * dx
         w_prev = w_curr
@@ -54,7 +54,7 @@ cdef double draw_boltzmann_x0(
     gsl_utils.gsl_spline_eval_e(spline, x_lo, acc, &Ug)
     w_prev = exp(-(Ug - Umin))
     for j in range(1, N_grid):
-        gsl_utils.gsl_spline_eval_e(spline, x_lo + j * dx, acc, &Ug)
+        gsl_utils.gsl_spline_eval_e(spline, min(x_lo + j * dx, x_knots[N - 1]), acc, &Ug)
         w_curr = exp(-(Ug - Umin))
         c_prev = c_curr
         c_curr += 0.5 * (w_prev + w_curr) * dx
