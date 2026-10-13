@@ -1,4 +1,4 @@
-"""HMC posterior sampler: the target identity, warm starts, short chains, continuing a chain.
+"""HMC posterior sampler: the target identity, warm starts, chains, a sampled curvature weight.
 
 The load-bearing test here is ``test_target_is_fit_objective``: the sampler's whole
 contract is that its target density is ``infer.fit``'s objective negated, so that a chain
@@ -493,3 +493,77 @@ def test_starting_matrix_is_used_and_kept_without_warmup():
     M = 0.09 * (A @ A.T / dim + torch.eye(dim, dtype=torch.float64))
     ps = _run(s, warmup=0, adapt_step_size=False, inverse_mass_matrix=M)
     assert torch.allclose(ps.inverse_mass_matrix.cpu(), M)
+
+
+# --------------------------------------------------------------------------- #
+# a sampled curvature weight (hierarchical curvature prior)
+# --------------------------------------------------------------------------- #
+HYPER = (math.log(1e-3), 2.3)       # mean and sd of the normal prior on ln w
+
+
+@pytest.mark.parametrize("prior", [
+    dfl.PriorConfig(curvature_weight=0.05),
+    dfl.PriorConfig(curvature_weight=0.05, **BG_PRIOR),     # the bg prior must stay in
+])
+def test_sampled_weight_target_is_the_fixed_target_plus_a_constant(prior):
+    """At ln w = ln w0 the hierarchical target differs from the fixed-weight one only by
+    the normalising term and the hyperprior: a constant, the same for every theta."""
+    s = _setup()
+    w0 = prior.curvature_weight
+    lp_fix, z0, _ = _build(s, prior, D_init=2.0)
+    lp_hier, z0_h, info = _build(s, prior, D_init=2.0, curvature_hyperprior=HYPER)
+    i = info["i_log_weight"]
+    assert i == z0.numel() and z0_h.numel() == z0.numel() + 1
+    assert torch.equal(z0_h[:i], z0) and math.isclose(float(z0_h[i]), math.log(w0))
+
+    K, (m, sd) = s["pot"].theta.numel(), HYPER
+    const = 0.5 * (K - 2) * math.log(w0) - 0.5 * ((math.log(w0) - m) / sd) ** 2
+    for k in range(3):
+        g = torch.Generator().manual_seed(k)
+        z = z0 + 0.25 * torch.randn(z0.numel(), generator=g, dtype=torch.float64)
+        diff = float(lp_hier(torch.cat([z, z0_h[i:]]))) - float(lp_fix(z))
+        assert math.isclose(diff, const, rel_tol=1e-10, abs_tol=1e-10), f"draw {k}"
+
+
+def test_sampled_weight_gradient_has_the_normalising_term():
+    """d log_prob / d ln w = (K-2)/2 - w R(theta) - (ln w - m)/s^2.
+
+    The (K-2)/2 is the curvature prior's normalising term; without it the chain would send
+    the weight to zero.
+    """
+    from diff_fret_likelihood.objective import curvature_penalty_spline
+    s = _setup()
+    lp, z0, info = _build(s, D_init=2.0, curvature_hyperprior=HYPER)
+    i, npot = info["i_log_weight"], info["npot"]
+    K, (m, sd) = s["pot"].theta.numel(), HYPER
+    R = float(curvature_penalty_spline(z0[:npot], s["pot"].knots_x))
+    assert R > 0                                    # CURVED_THETA: the term is active
+    for u in (math.log(1e-4), math.log(0.05), math.log(3.0)):
+        z = z0.clone()
+        z[i] = u
+        z.requires_grad_(True)
+        (g,) = torch.autograd.grad(lp(z), z)
+        want = 0.5 * (K - 2) - math.exp(u) * R - (u - m) / sd ** 2
+        assert math.isclose(float(g[i]), want, rel_tol=1e-9, abs_tol=1e-9), u
+
+
+def test_sampled_weight_comes_back_with_the_draws():
+    s = _setup()
+    ps = _run(s, curvature_hyperprior=HYPER)
+    n = ps.z.shape[0]
+    assert ps.z.shape[1] == ps.theta.shape[1] + 1 + S.N_RATES + 1
+    assert ps.curvature_weight.shape == (n,) and (ps.curvature_weight > 0).all()
+    assert torch.allclose(ps.curvature_weight, ps.z[:, -1].exp())
+    assert _run(_setup()).curvature_weight is None          # held fixed by default
+    pytest.importorskip("arviz")
+    assert "log_curvature_weight" in ps.to_arviz().posterior
+
+
+@pytest.mark.parametrize("prior", [
+    None,
+    dfl.PriorConfig(**BG_PRIOR),                                    # no curvature term
+    dfl.PriorConfig(curvature_weight=0.05, curvature_norm="l1"),    # other normaliser
+])
+def test_sampled_weight_needs_a_positive_l2_curvature_prior(prior):
+    with pytest.raises(ValueError, match="curvature_hyperprior"):
+        _build(_setup(), prior, D_init=2.0, curvature_hyperprior=HYPER)
