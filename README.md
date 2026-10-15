@@ -20,7 +20,7 @@ bars cheap to compute.
 | optional | `pyro-ppl` ≥ 1.9 (extra `sampling`), `arviz` ≥ 0.17 (extra `diagnostics`) | sampling the full posterior instead of a single fit |
 | optional | `pytest`, `matplotlib` (extra `dev`) | running the test suite |
 
-Nothing in this README needs the optional packages.
+Only Example 3, the full posterior, needs the optional packages.
 
 ## Install
 
@@ -137,7 +137,7 @@ batch = dfl.simulate.simulate_equilibrium(
     x_knots, y_knots, D_true, R0, kD, beta_g, beta_r, eta_g, eta_r, C_gr, C_rg,
     T=150.0, dt=5e-6, n_traces=128, seed=0,
 )
-# 128/128 traces in 15.0s | photons/trace min/med/max = [867 956 1029]
+# 128/128 traces in 15.0s | photons/trace min/med/max = [867 956 1029] | workers=24
 ```
 
 That landscape is two wells at 4.8 and 7.2 nm with a 4 kT barrier between them,
@@ -167,11 +167,11 @@ res = dfl.fit(
 )
 
 U = dfl.recovered_potential(res.potential, grid)   # [160] landscape in kT
-print(res.D, res.stop_reason)
+print(f"D = {res.D:.2f} nm^2/ms  (true {D_true})   stop: {res.stop_reason}")
 ```
 
 ```
-D = 7.47 nm^2/ms  (true 10.0)   stop: plateau@67
+D = 7.50 nm^2/ms  (true 10.0)   stop: plateau@67
 ```
 
 About 2 to 3 minutes on a 24-core CPU, plus ~16 s to simulate the traces.
@@ -191,8 +191,8 @@ Reading the output:
   the photons cannot justify. `prior=None` drops it for a pure unpenalised
   maximum-likelihood fit, and on this dataset that is a real trade rather than a
   disaster: it finds a marginally better likelihood and a barrier of 4.2 kT, but
-  returns `D = 15` instead of 7.5, with error bars 7× wider on the barrier and
-  15× wider on `D` (next section).
+  returns `D = 15` instead of 7.5, with error bars more than 15× wider on both
+  the barrier and `D` (next section).
   The smoothness assumption buys precision by accepting a little bias. Pick its
   weight by comparing the likelihood on data you did *not* fit — not against a
   truth you would not have in a real experiment.
@@ -222,16 +222,16 @@ print("unconstrained directions:", crb.null_dim)
 ```
 
 ```
-D = 7.47 +/- 12.61 nm^2/ms
-U(3.50 nm) = +1.56 +/- 6.14 kT
-U(4.12 nm) = -0.40 +/- 2.94 kT
-U(4.75 nm) = -1.82 +/- 2.56 kT
-U(5.38 nm) = -1.39 +/- 2.22 kT
-U(6.00 nm) = +1.38 +/- 3.12 kT
-U(6.62 nm) = -0.87 +/- 3.54 kT
-U(7.25 nm) = -2.28 +/- 2.37 kT
-U(7.88 nm) = +0.71 +/- 4.21 kT
-U(8.50 nm) = +3.10 +/- 11.13 kT
+D = 7.50 +/- 27.00 nm^2/ms
+U(3.50 nm) = +1.57 +/- 13.35 kT
+U(4.12 nm) = -0.38 +/- 5.49 kT
+U(4.75 nm) = -1.81 +/- 3.73 kT
+U(5.38 nm) = -1.38 +/- 6.72 kT
+U(6.00 nm) = +1.40 +/- 6.90 kT
+U(6.62 nm) = -0.86 +/- 6.29 kT
+U(7.25 nm) = -2.27 +/- 3.43 kT
+U(7.88 nm) = +0.72 +/- 4.96 kT
+U(8.50 nm) = +3.02 +/- 13.13 kT
 unconstrained directions: 0
 ```
 
@@ -241,13 +241,13 @@ taking more data. The numbers are the Cramér–Rao bound: the smallest error ba
 *any* unbiased method could achieve from this many photons. Treat it as the best
 case, not as a promise about your fit.
 
-The `± 12.6` on `D` is the honest headline here: 122,000 photons from dyes this
+The `± 27` on `D` is the honest headline here: 122,000 photons from dyes this
 dim do not pin the diffusion coefficient down at all, even though the fit
 returned a plausible-looking 7.5. Three things to know when reading the rest:
 
 * Pass the same `prior` you fitted with. Without it the bound has to allow for
   all the wiggly landscapes the smoothness assumption ruled out, and at this data
-  size that inflates every number by a factor of 20 to 80.
+  size that inflates every number by a factor of 10 or more.
 * The error bars cover the photophysics too — the brightness and background are
   scored alongside the landscape even though the fit held them fixed. A separately
   calibrated background makes them tighter.
@@ -265,10 +265,10 @@ print(f"barrier = {float(theta[top] - theta[well]):+.2f} "
 ```
 
 ```
-barrier = +3.20 +/- 1.91 kT        (true 4.00)
+barrier = +3.21 +/- 4.05 kT        (true 4.00)
 ```
 
-± 1.91 kT, against 5.68 kT if you had naively added the two knot error bars.
+± 4.05 kT, against 10.63 kT if you had naively added the two knot error bars.
 
 `crb.sigma_physical` also has entries for the photophysics rates (`a_g`, `a_r`,
 `bg_g`, `bg_r`, in kHz), and `crb.n_traces` / `crb.n_photons` record how much
@@ -287,12 +287,15 @@ over the fit's objective, with the weight of the curvature prior sampled too.
 Continuing from Example 1:
 
 ```python
+import torch
+
 prior = dfl.PriorConfig(curvature_weight=0.002,
                         bg_g_mean=beta_g, bg_g_sd=0.1 * beta_g,   # calibrated background
                         bg_r_mean=beta_r, bg_r_sd=0.1 * beta_r)
+pot3  = dfl.build_potential(dfl.PotentialConfig(n_knots=9), grid)
 
 post = dfl.sample.sample_posterior(
-    batch, grid, pot, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
+    batch, grid, pot3, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
     num_samples=400, warmup=400,
     compile_mode="default", propagate_dtype=torch.float32,   # much faster per gradient
 )
@@ -307,9 +310,10 @@ print(f"curvature weight = {float(post.curvature_weight.median()):.2g}")
 You do not have to set up anything before that call. `rates_init` defaults to
 `init.stream_rates`, the landscape is initialised from the FRET histogram
 (`init.kde_potential_init`), and the chain then starts from a quick MAP fit —
-which is what keeps burn-in short. `kde_bin_ms=...` pins the histogram bin width
-and skips the held-out scan that chooses it, which is the expensive part of the
-warm start.
+which is what keeps burn-in short. Both warm starts write into the potential you
+pass, which is why it gets a fresh one here: Example 1's `pot` is `res.potential`,
+and it stays as fitted. `kde_bin_ms=...` pins the histogram bin width and skips
+the held-out scan that chooses it, which is the expensive part of the warm start.
 
 **The sampler lets the data choose the curvature weight.** At a fixed weight `w`
 its target is the objective `fit` minimises at that weight, negated, plus the
@@ -324,7 +328,7 @@ Multiple chains, which is how you find out whether to believe any of it:
 
 ```python
 multi = dfl.sample.sample_posterior_multi(
-    batch, grid, pot, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
+    batch, grid, pot3, C=consts.crosstalk_tensor(), R0=consts.R0, prior=prior,
     num_chains=4, num_samples=400, warmup=400,
     compile_mode="default", propagate_dtype=torch.float32,
 )
@@ -347,10 +351,10 @@ Things worth knowing before you trust a band:
   as for the fit, and it matters more here.
 * **Only differences in `U` are meaningful**, so read the band as a band on shape.
   A barrier height is the honest thing to quote, exactly as in Example 2.
-* `curvature_norm="l1"` is a poor choice for sampling and warns: it is not
-  differentiable where the curvature crosses zero, and the leapfrog integrator
-  cannot cross that kink cleanly. Use the default `"l2"`.
-* **`fit_bg=False`** holds the backgrounds at their calibrated values instead of
+* `curvature_norm="l1"` is refused: it is not differentiable where the curvature
+  crosses zero, and the leapfrog integrator cannot cross that kink cleanly. Use
+  the default `"l2"`.
+* **`fi‚t_bg=False`** holds the backgrounds at their calibrated values instead of
   sampling them. `fit_rates` is a warm-start knob only — the chain always samples
   the brightnesses, since marginalising over the photophysics is the point.
 
@@ -416,18 +420,10 @@ python -m pytest tests -q                 # everything
 python -m pytest tests -q -m "not slow"   # skips the multi-minute statistical tests
 ```
 
-## Good to know
-
-* Only about 3 nm of distance is visible to FRET — the efficiency is steep for
-  `x ≈ 4.4 … 7.2` nm when `R0 = 6` nm, and saturated outside it. Fit on that band
-  and do not expect to see features beyond it.
-* Keep the grid inside the region the molecule actually visited. A grid running up
-  a steep wall of `U` (past roughly 10 kT) makes the fit unstable.
-* If your traces have no absolute start time or window length, the likelihood
-  conditions on the first photon (`t_1 = 0`, `T = t_last`). Give it the real
-  window when you know it.
-* `D` is a physical number in nm²/ms wherever you see it. Internally the fit
-  works with `log D`, which is why it can never wander negative.
+The tests import the package from this source tree, not from the installed copy.
+After a plain `pip install .`, run `python build_cython.py` once first, so the tree
+has the compiled simulator too; otherwise the simulator tests are skipped. An
+editable install already has it.
 
 ## Licence
 

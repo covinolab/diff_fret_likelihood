@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "diff_fret_likelihood"
 dynamic = ["version"]
-description = "Differentiable smFRET marked-point-process likelihood for free-energy landscape, diffusion, and photophysics inference."
+description = "Differentiable smFRET likelihood for free-energy landscape, diffusion, and photophysics inference."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "Covino Lab" }]
+authors = [{ name = "Lars Dingeldein" }]
 keywords = [
     "smFRET",
     "single-molecule-FRET",
@@ -21,10 +21,6 @@ keywords = [
     "cython",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "Topic :: Scientific/Engineering :: Physics",
-    "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Cython",
@@ -40,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sampling = ["pyro-ppl>=1.9"]            # sample.py HMC/NUTS (lazy import)
+sampling = ["pyro-ppl>=1.9"]            # sample.py NUTS (lazy import)
 diagnostics = ["arviz>=0.17"]           # R-hat / ESS diagnostics (lazy)
 dev = [
     "pytest>=7",
