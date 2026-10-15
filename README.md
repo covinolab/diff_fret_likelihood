@@ -283,7 +283,8 @@ method could manage. Between them sits the question they cannot answer: what doe
 the *posterior* actually look like — is it a tidy ellipse around the fit, or
 something long and banana-shaped that a single number cannot summarise?
 `sample_posterior` answers that by running Hamiltonian Monte Carlo (pyro's NUTS)
-over the same objective the fit minimises. Continuing from Example 1:
+over the fit's objective, with the weight of the curvature prior sampled too.
+Continuing from Example 1:
 
 ```python
 prior = dfl.PriorConfig(curvature_weight=0.002,
@@ -300,6 +301,7 @@ U_mean = post.U_mean()                # [G] posterior-mean landscape, grid-mean 
 lo, hi = post.U_band((0.05, 0.95))    # [2, G] 90% band of U(x)
 print(f"D = {float(post.D.median()):.2f} "
       f"[{float(post.D.quantile(0.05)):.2f}, {float(post.D.quantile(0.95)):.2f}]")
+print(f"curvature weight = {float(post.curvature_weight.median()):.2g}")
 ```
 
 You do not have to set up anything before that call. `rates_init` defaults to
@@ -309,12 +311,14 @@ which is what keeps burn-in short. `kde_bin_ms=...` pins the histogram bin width
 and skips the held-out scan that chooses it, which is the expensive part of the
 warm start.
 
-**The sampler targets exactly the objective `fit` minimises**, negated. It adds no
-prior of its own: the curvature and background terms come from the `PriorConfig`
-you pass, exactly as they do for `dfl.fit`, and `prior=None` is a pure
-maximum-likelihood target here just as it is there. So a chain and a fit on the
-same `prior` and `gauge_sd` describe the same posterior — the fit reports its
-mode, the chain its shape.
+**The sampler lets the data choose the curvature weight.** At a fixed weight `w`
+its target is the objective `fit` minimises at that weight, negated, plus the
+curvature prior's normalising term `(K-2)/2 ln w`; `ln w` itself gets a flat
+prior and is sampled with everything else, so the uncertainty in how smooth the
+landscape should be ends up in the band. The chain starts at
+`prior.curvature_weight`, the weight the MAP fit uses, and the draws carry
+`post.curvature_weight`. `prior` therefore needs an L2 curvature term with a
+positive weight; the background terms enter exactly as they do in `dfl.fit`.
 
 Multiple chains, which is how you find out whether to believe any of it:
 

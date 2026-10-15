@@ -1,58 +1,43 @@
-"""HMC/NUTS posterior sampling of the landscape U(x), D and the emission rates.
+"""NUTS sampling of the posterior over the landscape U(x), D, the emission rates and the
+weight of the curvature prior.
 
-Where ``infer.fit`` returns a MAP point estimate, this module draws from the full
-posterior with **pyro** NUTS/HMC.
+``infer.fit`` returns the MAP at a fixed curvature weight.  This module draws from the full
+posterior with pyro's NUTS and samples that weight as well, so the data decide how smooth
+the landscape is.
 
-The one thing to know about this module: **its target density is exactly the objective
-``infer.fit`` minimises, negated.**  Term for term,
+The chain moves in one unconstrained vector, with the positive quantities in log space,
 
-    log_prob(z) = -( neg_log_posterior(..., prior) + gauge_penalty(..., gauge_sd) )
+    z = [ theta | ln D | ln a_g, ln a_r (, ln bg_g, ln bg_r) | ln w ]
 
-which is ``infer.fit``'s ``closure_value()`` with a minus sign.  So the sampler adds no
-prior of its own: everything that shapes the posterior comes from the ``PriorConfig`` you
-pass (the curvature roughness prior and the background Gamma prior), exactly as it does
-for the fit.  ``prior=None`` means pure MLE here just as it does there.  The single term
-outside the config is the **gauge anchor** -- a Gaussian on ``mean(theta)``, which is a
-choice of coordinates rather than a belief: the likelihood is invariant to ``U -> U + c``,
-so that direction has to be pinned before it can be sampled.  ``infer.fit`` adds the same
-anchor with the same ``gauge_sd``, which is why the two agree.
+where ``theta`` are the K knot heights of the spline landscape.  Its target is
 
-The one opt-in exception is ``curvature_hyperprior``: it samples the curvature prior's
-weight ``w`` as well, instead of holding it at ``prior.curvature_weight``.  The fixed
-curvature term is then replaced by the hierarchical one,
+    log p(z) =  log L(theta, D, rates)          photon-by-photon likelihood
+              - bg_penalty(rates)                Gamma calibration prior (if configured)
+              - w R(theta) + (K-2)/2 ln w        curvature prior with its normalising term
+              - mean(theta)^2 / (2 gauge_sd^2)   gauge anchor (U -> U + c)
 
-    -w * R(theta) + (K-2)/2 * ln w - (ln w - m)**2 / (2 s**2)
+with flat priors on ln D, ln a_g, ln a_r and ln w.
 
-(``R`` the curvature penalty, ``K`` the number of knots, ``(m, s)`` a normal prior on
-``ln w``), so the target is no longer any fit's objective.  The middle term is the
-normalising term of the curvature prior, whose rank is K-2; without it nothing would stop
-the chain from sending ``w`` to zero.
+* ``R(theta)`` is ``objective.curvature_penalty_spline``: the sum of squared second
+  differences of the knot heights, the roughness ``infer.fit`` penalises.
+* ``(K-2)/2 ln w`` normalises the curvature prior, a Gaussian of rank K-2 whose precision
+  is proportional to ``w``.  Without it the chain would send ``w`` to zero.
+* The gauge anchor pins the one direction the likelihood cannot see, a constant shift of
+  U.  ``infer.fit`` adds the same anchor.
+* With ``sample_bg=False`` the two backgrounds are held at given values and drop out of z.
 
-Caveat worth knowing before trusting a band: the curvature prior is the improper
-thin-plate limit, so it constrains roughness but not the constant or linear directions of
-``U``.  The gauge anchor handles the constant; the tilt is left to the likelihood.  The
-practical remedy is to narrow the grid to the region the photons actually inform, which is
-what the published fits do.
+At a fixed ``w`` the target is ``infer.fit``'s objective at that weight, negated, plus the
+constant ``(K-2)/2 ln w``: a fit at weight ``w`` finds the mode of the chain's posterior
+given that ``w``.
 
-pyro's NUTS is real NUTS: it chooses each trajectory's length dynamically via the
-No-U-Turn criterion (bounded by ``max_tree_depth``) and adapts both the step size and the
-mass matrix during warmup.  We hand it ``build_log_prob``'s scalar as a ``potential_fn``
-and let it do the preconditioning -- no hand-rolled metric.  (The one sign convention to
-remember: pyro minimises *energy*, so ``potential_fn = -log_prob``.)
-
-Flat parameter layout (unconstrained; positives are sampled in log space):
-
-    z = [ theta | logD | log_a_g, log_a_r (, log_bg_g, log_bg_r) (| ln w) ]
-
-The two background entries are present only when ``sample_bg`` is true; with a calibrated
-background held fixed they drop out of ``z`` and are carried through from ``rates_init``.
-``ln w`` is present only when the curvature weight is sampled (``curvature_hyperprior``).
+pyro's NUTS chooses each trajectory's length itself (up to ``max_tree_depth`` doublings)
+and adapts the step size and a dense mass matrix during warmup.  It minimises an energy,
+so it is handed ``-log p``.
 
 Usage::
 
     post = sample_posterior(batch, grid, pot, C, R0, prior)   # KDE + MAP warm start
-    U_mean = post.U_mean()
-    lo, hi = post.U_band((0.05, 0.95))
+    post.U, post.D, post.curvature_weight                     # one row per draw
 """
 
 from __future__ import annotations
@@ -60,14 +45,14 @@ from __future__ import annotations
 import copy
 import math
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
-from torch.func import functional_call
 
 from .config import DTYPE, PhysicsConstants, PriorConfig
-from .objective import (neg_log_posterior, gauge_offset_from_theta,
-                        gauge_penalty_from_offset, curvature_penalty_spline)
+from .forward import marginal_loglik_batch
+from .objective import (bg_penalty, curvature_penalty_spline, gauge_offset_from_theta,
+                        gauge_penalty_from_offset)
 from .photophysics import EffectiveRates
 
 N_RATES = 4                                        # a_g, a_r, bg_g, bg_r
@@ -75,193 +60,98 @@ RATE_NAMES = ("a_g", "a_r", "bg_g", "bg_r")
 
 
 # --------------------------------------------------------------------------- #
-# flat <-> structured parameter helpers
+# the target
 # --------------------------------------------------------------------------- #
 def _require_spline(potential, where):
-    """The flat vector is ``[theta | logD | log rates]`` and the gauge anchor is
-    ``mean(theta)``: spline-only.  Refuse anything else up front -- before the warm
-    start can touch the potential and before ``torch.cat`` trips over an empty
-    parameter list."""
+    """The knot heights are what the chain samples: spline landscapes only.  Refused up
+    front, before a warm start can touch the potential."""
     if not hasattr(potential, "_basis"):
         raise NotImplementedError(
-            f"{where} supports SplinePotential only (its parameter vector is the knot "
-            f"heights and its gauge anchor mean(theta)); got {type(potential).__name__}. "
-            "FixedPotential / ParametricPotential landscapes have no sampler yet."
+            f"{where} supports SplinePotential only (it samples the knot heights); got "
+            f"{type(potential).__name__}. FixedPotential / ParametricPotential landscapes "
+            "have no sampler."
         )
 
 
-def _param_specs(potential):
-    """[(name, shape, numel)] for the potential's learnable parameters."""
-    return [(n, tuple(p.shape), p.numel()) for n, p in potential.named_parameters()]
-
-
-def _unflatten(flat, specs, prefix=""):
-    """Map a flat 1-D tensor to a {name: view} dict (views keep the graph)."""
-    out, ptr = {}, 0
-    for name, shape, numel in specs:
-        out[prefix + name] = flat[ptr:ptr + numel].view(shape)
-        ptr += numel
-    return out
-
-
-def _flatten_init(potential, D_init, rates_init, *, device=None, sample_bg=True):
-    """Build ``z0`` from the potential's current params, ``D_init`` and ``rates_init``.
-
-    ``device`` defaults to the potential's own; ``sample_posterior`` passes the grid's so
-    the whole vector and the target live on one device.  With ``sample_bg=False`` the two
-    background entries are omitted -- they are held at their ``rates_init`` values.
-    """
-    pot_flat = torch.cat(
-        [p.detach().reshape(-1) for _, p in potential.named_parameters()]
-    ).to(DTYPE)
-    dev = pot_flat.device if device is None else device
-    pot_flat = pot_flat.to(dev)
-    logD = torch.log(torch.as_tensor(float(D_init), dtype=DTYPE, device=dev)).reshape(1)
-    values = [rates_init.a_g, rates_init.a_r]
-    if sample_bg:
-        values += [rates_init.bg_g, rates_init.bg_r]
-    log_rates = torch.log(torch.tensor(
-        [float(v) for v in values], dtype=DTYPE, device=dev))
-    return torch.cat([pot_flat, logD, log_rates])
-
-
-# --------------------------------------------------------------------------- #
-# log-posterior as a function of the flat vector
-# --------------------------------------------------------------------------- #
-class _NLPModule(torch.nn.Module):
-    """Wraps the potential so ``functional_call`` can swap its params for the whole
-    ``neg_log_posterior`` evaluation.
-
-    The swap is what lets the target be a function of a flat ``z`` while the likelihood
-    keeps calling ``potential`` as an ordinary module; the original parameters are
-    restored automatically afterwards.
-    """
-
-    def __init__(self, potential):
-        super().__init__()
-        self.potential = potential
-
-    def forward(self, D, rates, ipt, colors, mask, grid, C, R0, prior, p0,
-                compile_mode=None, propagate_dtype=None):
-        return neg_log_posterior(
-            ipt, colors, mask, self.potential, D, rates, grid, C, R0, prior, p0=p0,
-            compile_mode=compile_mode, propagate_dtype=propagate_dtype,
+def _require_l2_curvature_prior(prior):
+    """The weight of the curvature prior is sampled, so there must be one: L2, because
+    ``(K-2)/2 ln w`` is the normalising term of the Gaussian form, and with a positive
+    weight, which is where the MAP warm start (and by default the chain) puts it."""
+    if prior is None or prior.curvature_norm != "l2" or not prior.curvature_weight > 0:
+        raise ValueError(
+            "the sampler needs a PriorConfig with an L2 curvature prior "
+            f"(curvature_norm='l2', curvature_weight > 0); got {prior!r}"
         )
 
 
-def _warn_about_prior(prior):
-    """Diagnostics only -- these never change the target density."""
-    if prior is None or not prior.active_terms():
-        warnings.warn(
-            "sampling with no prior at all: the target is the bare marginal likelihood "
-            "plus the gauge anchor. U's roughness directions are then nearly "
-            "unconstrained, so the chain random-walks there and the posterior band on U "
-            "comes out far wider than the data warrant. This is almost never intended -- "
-            "pass a PriorConfig.",
-            RuntimeWarning, stacklevel=3,
-        )
-    if prior is not None and prior.curvature_weight and prior.curvature_norm == "l1":
-        warnings.warn(
-            "curvature_norm='l1' is not differentiable at d2=0; leapfrog cannot integrate "
-            "the kink, so acceptance and the shape of the posterior are both biased. Use "
-            "'l2' for sampling.",
-            RuntimeWarning, stacklevel=3,
-        )
+class _Landscape:
+    """A landscape given by its values on the grid: ``on_grid`` is the one thing the
+    likelihood asks of a potential."""
+
+    def __init__(self, U):
+        self.U = U
+
+    def on_grid(self, grid):
+        return self.U
 
 
 def build_log_prob(
-    batch, grid, potential, C, R0, prior: PriorConfig | None, rates_init, *,
-    D_init, gauge_sd: float = 1.0, sample_bg: bool = True, curvature_hyperprior=None,
-    p0=None, compile_mode=None, propagate_dtype=None,
+    batch, grid, potential, C, R0, prior: PriorConfig, rates_init, *, D_init,
+    curvature_weight_init=None, gauge_sd: float = 1.0, sample_bg: bool = True, p0=None,
+    compile_mode=None, propagate_dtype=None,
 ):
-    """Return ``(log_prob_func, z0, info)`` for the sampler.
+    """Return ``(log_prob, z0, info)``: the target of the module docstring as a function of
+    the flat vector ``z``, the starting point, and the layout of ``z``.
 
-    ``log_prob_func(z) -> scalar`` is ``-(neg_log_posterior + gauge)``, differentiable
-    w.r.t. the flat vector ``z``.  That expression is ``infer.fit``'s objective negated;
-    see the module docstring.  ``prior`` is used exactly as ``infer.fit`` uses it -- passed
-    through untouched, ``None`` meaning pure MLE -- and no prior term is added here.
+    ``prior`` must have an L2 curvature prior with a positive ``curvature_weight``; its
+    background terms, if any, enter as they do in ``infer.fit``.  The start is the knot
+    heights in ``potential``, ``D_init``, ``rates_init`` and the weight
+    ``curvature_weight_init`` (default ``prior.curvature_weight``, the weight the MAP is
+    fitted with).  ``sample_bg=False`` holds ``bg_g``/``bg_r`` at their ``rates_init``
+    values and drops them from ``z``, as ``infer.fit(fit_bg=False)`` does.
 
-    ``sample_bg=False`` freezes ``bg_g``/``bg_r`` at their ``rates_init`` values and drops
-    them from ``z``, mirroring ``infer.fit(fit_bg=False)``.
-
-    ``curvature_hyperprior=(m, s)`` samples the curvature weight ``w`` too: ``z`` gains
-    ``ln w`` as its last entry, starting at ``ln prior.curvature_weight``, the prior's
-    fixed curvature term is dropped, and the target gains ``-w R(theta) + (K-2)/2 ln w``
-    and a normal prior with mean ``m`` and sd ``s`` on ``ln w`` (see the module docstring).
-    It needs an L2 curvature prior with a positive weight.  ``info["i_log_weight"]`` is the
-    position of ``ln w`` in ``z``, ``None`` when the weight is held fixed.
+    ``info``: ``npot`` (K), ``n_sampled_rates`` (4, or 2 with fixed backgrounds),
+    ``rate_names``, ``i_log_weight`` (the last entry of ``z``) and ``dim``.
     """
     _require_spline(potential, "build_log_prob")
-    _warn_about_prior(prior)
+    _require_l2_curvature_prior(prior)
+    w0 = float(prior.curvature_weight if curvature_weight_init is None
+               else curvature_weight_init)
+    if not w0 > 0:
+        raise ValueError(f"curvature_weight_init must be positive, got {w0}")
 
-    specs = _param_specs(potential)
-    npot = sum(numel for _, _, numel in specs)
+    K = potential.theta.numel()
     n_rates = N_RATES if sample_bg else 2
-
-    # A sampled curvature weight: the likelihood call gets the prior without its curvature
-    # term (the background prior stays), and log_prob_func adds the hierarchical one.
-    sample_weight = curvature_hyperprior is not None
-    prior_lik, i_log_weight = prior, None
-    if sample_weight:
-        if prior is None or not prior.curvature_weight > 0:
-            raise ValueError("curvature_hyperprior needs a PriorConfig with curvature_weight "
-                             "> 0: that weight is where the chain starts")
-        if prior.curvature_norm != "l2":
-            raise ValueError("curvature_hyperprior needs curvature_norm='l2': the L1 prior "
-                             "has a different normalising term")
-        hyper_mean, hyper_sd = (float(v) for v in curvature_hyperprior)
-        n_curv = potential.knots_x.numel() - 2          # rank of the curvature prior
-        prior_lik = replace(prior, curvature_weight=0.0)
-        i_log_weight = npot + 1 + n_rates
-
-    module = _NLPModule(potential)
+    M = potential._basis(grid)                     # [G, K]: U on the grid = M @ theta
+    knots_x = potential.knots_x
     ipt, colors, mask = batch.ipt, batch.colors, batch.mask
+    with_bg_prior = prior.bg_g_mean is not None or prior.bg_r_mean is not None
+    if not sample_bg:                              # held fixed: constants, no gradient
+        bg_g, bg_r = (torch.as_tensor(float(v), dtype=DTYPE, device=grid.device)
+                      for v in (rates_init.bg_g, rates_init.bg_r))
 
-    # frozen backgrounds: detached, so no gradient flows into them
-    bg_fixed = None if sample_bg else (
-        torch.as_tensor(rates_init.bg_g, dtype=DTYPE, device=grid.device).detach(),
-        torch.as_tensor(rates_init.bg_r, dtype=DTYPE, device=grid.device).detach(),
-    )
-
-    def log_prob_func(z):
-        flat_pot = z[:npot]
-        logD = z[npot]
-        log_rates = z[npot + 1:npot + 1 + n_rates]
-
-        pdict = _unflatten(flat_pot, specs, prefix="potential.")
-        D = logD.exp()
-        r = log_rates.exp()
+    def log_prob(z):
+        theta, logD, u = z[:K], z[K], z[-1]        # u = ln w
+        r = z[K + 1:K + 1 + n_rates].exp()
         rates = (EffectiveRates(r[0], r[1], r[2], r[3]) if sample_bg
-                 else EffectiveRates(r[0], r[1], bg_fixed[0], bg_fixed[1]))
-        nlp = functional_call(
-            module, pdict,
-            args=(D, rates, ipt, colors, mask, grid, C, R0, prior_lik, p0,
-                  compile_mode, propagate_dtype),
-        )
-        # The gauge offset must be read off the swapped z-slice, not potential.theta:
-        # the module's params only exist substituted inside the functional_call above.
-        gauge = gauge_penalty_from_offset(gauge_offset_from_theta(flat_pot), gauge_sd)
-        logp = -(nlp + gauge)          # == -(infer.fit's closure_value) for a fixed weight
-        if sample_weight:
-            # curvature prior with weight w = e^u and its normalising term, plus the
-            # normal hyperprior on u
-            u = z[i_log_weight]
-            R = curvature_penalty_spline(pdict["potential.theta"], potential.knots_x)
-            logp = (logp - u.exp() * R + 0.5 * n_curv * u
-                    - 0.5 * ((u - hyper_mean) / hyper_sd) ** 2)
-        return logp
+                 else EffectiveRates(r[0], r[1], bg_g, bg_r))
+        logp = marginal_loglik_batch(
+            ipt, colors, mask, _Landscape(M @ theta), logD.exp(), rates, grid, C, R0,
+            p0=p0, compile_mode=compile_mode, propagate_dtype=propagate_dtype)
+        if with_bg_prior:
+            logp = logp - bg_penalty(rates, prior)
+        logp = logp - u.exp() * curvature_penalty_spline(theta, knots_x) + 0.5 * (K - 2) * u
+        return logp - gauge_penalty_from_offset(gauge_offset_from_theta(theta), gauge_sd)
 
-    z0 = _flatten_init(potential, D_init, rates_init,
-                       device=grid.device, sample_bg=sample_bg)
-    if sample_weight:
-        log_w0 = torch.tensor([math.log(prior.curvature_weight)], dtype=DTYPE,
-                              device=z0.device)
-        z0 = torch.cat([z0, log_w0])
-    info = dict(specs=specs, npot=npot, dim=z0.numel(), n_sampled_rates=n_rates,
-                rate_names=RATE_NAMES[:n_rates], sample_bg=sample_bg,
-                i_log_weight=i_log_weight,
-                curvature_hyperprior=(hyper_mean, hyper_sd) if sample_weight else None)
-    return log_prob_func, z0, info
+    rates0 = [rates_init.a_g, rates_init.a_r]
+    if sample_bg:
+        rates0 += [rates_init.bg_g, rates_init.bg_r]
+    logs = torch.log(torch.tensor([float(D_init), *(float(v) for v in rates0), w0],
+                                  dtype=DTYPE, device=grid.device))
+    z0 = torch.cat([potential.theta.detach().to(device=grid.device, dtype=DTYPE), logs])
+    info = dict(npot=K, n_sampled_rates=n_rates, rate_names=RATE_NAMES[:n_rates],
+                i_log_weight=z0.numel() - 1, dim=z0.numel())
+    return log_prob, z0, info
 
 
 # --------------------------------------------------------------------------- #
@@ -269,19 +159,18 @@ def build_log_prob(
 # --------------------------------------------------------------------------- #
 @dataclass
 class PosteriorSamples:
-    U: torch.Tensor       # [S, G] gauge-fixed landscapes (grid-mean = 0)
-    D: torch.Tensor       # [S]
-    rates: torch.Tensor   # [S, 4]  (a_g, a_r, bg_g, bg_r); frozen entries are constant
-    theta: torch.Tensor   # [S, npot] knot heights
-    z: torch.Tensor       # [S, dim] raw unconstrained draws
-    grid: torch.Tensor    # [G]
+    U: torch.Tensor                  # [S, G] landscapes, grid-mean zero
+    D: torch.Tensor                  # [S]
+    rates: torch.Tensor              # [S, 4] (a_g, a_r, bg_g, bg_r); held-fixed ones constant
+    theta: torch.Tensor              # [S, K] knot heights
+    curvature_weight: torch.Tensor   # [S]
+    z: torch.Tensor                  # [S, dim] the raw draws
+    grid: torch.Tensor               # [G]
     n_sampled_rates: int = N_RATES   # 2 when the backgrounds were held fixed
     # the kernel at the end of the run -- what a later call needs to continue this chain
     step_size: float | None = None
     inverse_mass_matrix: torch.Tensor | None = None   # [dim, dim]; [dim] if diagonal
     n_divergences: int | None = None                  # divergent transitions among the draws
-    # [S] the curvature weight of each draw; None when it was held fixed
-    curvature_weight: torch.Tensor | None = None
 
     def U_mean(self) -> torch.Tensor:
         return self.U.mean(0)
@@ -312,9 +201,8 @@ def _posterior_dict(chains):
         post[f"theta_{k}"] = np.stack([c.theta[:n, k].cpu().numpy() for c in chains])
     for k, nm in enumerate(RATE_NAMES[:chains[0].n_sampled_rates]):
         post[f"log_{nm}"] = np.stack([np.log(c.rates[:n, k].cpu().numpy()) for c in chains])
-    if chains[0].curvature_weight is not None:
-        post["log_curvature_weight"] = np.stack(
-            [np.log(c.curvature_weight[:n].cpu().numpy()) for c in chains])
+    post["log_curvature_weight"] = np.stack(
+        [np.log(c.curvature_weight[:n].cpu().numpy()) for c in chains])
     return post
 
 
@@ -381,17 +269,17 @@ def _warm_start(batch, grid, potential, C, R0, prior, rates_init, *, physics,
 
 
 # --------------------------------------------------------------------------- #
-# starting mass matrix (continuing a chain)
+# one chain
 # --------------------------------------------------------------------------- #
-def _starting_from(base, inverse_mass_matrix):
-    """``base`` (pyro's NUTS or HMC), starting from ``inverse_mass_matrix`` instead of the
-    identity.
+def _nuts_starting_from(inverse_mass_matrix):
+    """pyro's NUTS, starting from ``inverse_mass_matrix`` instead of the identity.
 
-    pyro builds the identity inside ``setup``, so anything set earlier is overwritten; the
-    matrix is installed right after it.  If the step size is adapted, its initial search is
-    redone under the new matrix.
+    pyro builds the identity inside ``setup``, so the matrix is installed right after it.
+    If the step size is still adapted, its initial search is redone under the new matrix.
     """
-    class _StartingFrom(base):
+    from pyro.infer import NUTS
+
+    class _NUTS(NUTS):
         def setup(self, warmup_steps, *args, **kwargs):
             super().setup(warmup_steps, *args, **kwargs)
             (key,) = tuple(self.mass_matrix_adapter.inverse_mass_matrix)   # ("z",)
@@ -399,77 +287,57 @@ def _starting_from(base, inverse_mass_matrix):
             if self._adapter.adapt_step_size:
                 self._adapter.reset_step_size_adaptation(self._initial_params)
 
-    return _StartingFrom
+    return _NUTS
 
 
-# --------------------------------------------------------------------------- #
-# driver
-# --------------------------------------------------------------------------- #
 def sample_posterior(
-    batch, grid, potential, C, R0, prior: PriorConfig | None, rates_init=None, *,
+    batch, grid, potential, C, R0, prior: PriorConfig, rates_init=None, *,
     physics=None, kde_warmstart=True, kde_bin_ms=None, kde_kwargs=None,
     map_warmstart=True, map_optim=None, fit_rates=True, fit_bg=True, D_init=None,
-    sampler="nuts", num_samples=1000, warmup=200, step_size=0.01, target_accept=0.8,
-    full_mass=True, max_tree_depth=10, num_steps_per_sample=20, seed=0, init_jitter=0.0,
-    gauge_sd=1.0, curvature_hyperprior=None, p0=None, inverse_mass_matrix=None,
-    adapt_step_size=True, compile_mode=None, propagate_dtype=None, jit_compile=False,
-    verbose=True,
+    curvature_weight_init=None, num_samples=1000, warmup=200, step_size=0.01,
+    target_accept=0.8, full_mass=True, max_tree_depth=10, seed=0, init_jitter=0.0,
+    gauge_sd=1.0, p0=None, inverse_mass_matrix=None, adapt_step_size=True,
+    compile_mode=None, propagate_dtype=None, jit_compile=False, verbose=True,
 ) -> PosteriorSamples:
-    """Draw from the posterior over U(x), D and the emission rates with pyro HMC/NUTS.
-
-    The target is ``infer.fit``'s objective negated (see the module docstring), so a chain
-    and a fit run on the same ``prior`` and ``gauge_sd`` describe the same posterior.
-
-    **Sampling the curvature weight.**  ``curvature_hyperprior=(m, s)`` samples the
-    curvature prior's weight as well, with a normal prior of mean ``m`` and sd ``s`` on its
-    log; ``prior.curvature_weight`` is then only where the chain starts, and the draws carry
-    ``curvature_weight``.  The target is then no longer the fit's objective (see the module
-    docstring); the MAP warm start still runs at ``prior.curvature_weight``.
+    """One NUTS chain over the posterior of the module docstring: U(x), D, the rates and
+    the curvature weight.
 
     **Warm start.**  By default the landscape is initialised from the FRET histogram
     (``init.kde_potential_init``) and the chain then starts at the MAP (a quick
-    ``infer.fit``), which cuts burn-in sharply.  ``rates_init=None`` builds emission
-    brightnesses with ``init.stream_rates``, seeding the backgrounds from the prior's
-    calibration when it has one.  ``D_init`` falls back to the D profiled out by the KDE
-    bin-width scan, then to ``1.0``.  Set ``kde_bin_ms`` to pin the bin width and skip that
-    scan, which is the expensive part; ``kde_kwargs`` goes to ``init.select_bin_ms``.
-    ``physics`` is rebuilt from ``C``/``R0`` when not given.  Both warm starts modify
-    ``potential`` in place.
+    ``infer.fit`` at ``prior.curvature_weight``), which cuts burn-in sharply.
+    ``rates_init=None`` builds emission brightnesses with ``init.stream_rates``, seeding the
+    backgrounds from the prior's calibration when it has one.  ``D_init`` falls back to the
+    D profiled out by the KDE bin-width scan, then to ``1.0``.  ``kde_bin_ms`` pins the bin
+    width and skips that scan, which is the expensive part; ``kde_kwargs`` goes to
+    ``init.select_bin_ms``; ``physics`` is rebuilt from ``C``/``R0`` when not given.  Both
+    warm starts modify ``potential`` in place.  The weight starts at
+    ``curvature_weight_init``, by default ``prior.curvature_weight``.
 
-    **Sampler.**  ``sampler="nuts"`` (default) or ``"hmc"``.  ``full_mass=True`` adapts a
-    dense mass matrix, which captures the strong knot-to-knot correlations and the very
-    different parameter scales; keep ``warmup`` comfortably above the parameter dimension
-    for it to be well estimated (pyro's windowed adaptation reserves a 75-step start and a
-    50-step end buffer).  ``max_tree_depth`` caps the NUTS doubling depth.
-    ``num_steps_per_sample`` sets the trajectory length for ``"hmc"`` only -- NUTS chooses
-    its own.  ``init_jitter`` over-disperses the start in z-space and is what
-    ``sample_posterior_multi`` uses to make R-hat honest.
+    **Sampler.**  ``full_mass=True`` adapts a dense mass matrix during warmup, which
+    captures the strong knot-to-knot correlations and the very different parameter scales;
+    keep ``warmup`` well above the dimension of ``z`` (pyro's windowed adaptation reserves a
+    75-step start and a 50-step end buffer).  ``max_tree_depth`` caps the NUTS doublings.
+    ``init_jitter`` over-disperses the start in z-space, which ``sample_posterior_multi``
+    uses to make R-hat honest.  ``gauge_sd`` reaches the MAP fit too, so the start and the
+    chain share one gauge.
 
-    **Objective.**  ``gauge_sd`` is the width of the anchor on ``mean(theta)``; it is
-    forwarded to the MAP fit too, so the start and the chain share one gauge.
-
-    ``fit_rates`` and ``fit_bg`` are not symmetric here.  ``fit_rates`` is passed to the
-    MAP warm start and stops there: the chain samples ``a_g``/``a_r`` either way, since
-    marginalising over the photophysics is exactly what a posterior is for (and what
-    ``cramer_rao_bound`` scores).  ``fit_bg=False`` reaches both -- it holds
-    ``bg_g``/``bg_r`` at ``rates_init`` in the fit *and* drops them from ``z`` -- because a
-    separately calibrated background is a measurement to keep, not a parameter to infer.
+    **Rates.**  ``fit_rates`` reaches the MAP warm start only: the chain always samples
+    ``a_g``/``a_r``.  ``fit_bg=False`` reaches both -- it holds ``bg_g``/``bg_r`` at
+    ``rates_init`` in the fit and drops them from ``z`` -- because a separately calibrated
+    background is a measurement to keep, not a parameter to infer.
 
     **Continuing a chain.**  The draws carry the kernel's final ``step_size`` and
     ``inverse_mass_matrix``.  Pass them back with ``warmup=0``, ``init_jitter=0``,
-    ``adapt_step_size=False``, both warm starts off and the chain's last draw as the start
-    (the potential's knots, ``D_init``, ``rates_init``), and the chain continues with the
-    same kernel; only the random-number stream is new.  ``inverse_mass_matrix``
-    (``[dim, dim]``, or ``[dim]`` for a diagonal kernel, in z order) replaces the identity
-    pyro starts from; ``adapt_step_size=False`` keeps ``step_size`` exactly as given.  With
-    a sampled curvature weight, also start it at the last draw's: pass that as
-    ``prior.curvature_weight``.
+    ``adapt_step_size=False`` and both warm starts off, starting from the chain's last draw
+    (the potential's knots, ``D_init``, ``rates_init`` and ``curvature_weight_init``), and
+    the chain continues with the same kernel; only the random-number stream is new.
 
-    Returns ``PosteriorSamples`` (S = number of post-warmup draws).
+    Returns ``PosteriorSamples`` with the post-warmup draws.
     """
     _require_spline(potential, "sample_posterior")
+    _require_l2_curvature_prior(prior)
     import pyro
-    from pyro.infer import HMC, MCMC, NUTS
+    from pyro.infer import MCMC, NUTS
 
     device = grid.device
     # the Cython simulator emits CPU batches; move the batch (and the small crosstalk
@@ -498,78 +366,53 @@ def sample_posterior(
         D_init = float(res.D)
         rates_init = res.rates
 
-    # fit_rates governs the MAP warm start only -- the chain always samples the
-    # brightnesses, because marginalising over the photophysics is the point of a
-    # posterior. fit_bg is the one that also reaches the chain: a background you
-    # calibrated separately should be held, not re-inferred.
     sample_bg = bool(fit_bg)
-    log_prob_func, z0, info = build_log_prob(
+    log_prob, z0, info = build_log_prob(
         batch, grid, potential, C, R0, prior, rates_init, D_init=D_init,
-        gauge_sd=gauge_sd, sample_bg=sample_bg, curvature_hyperprior=curvature_hyperprior,
+        curvature_weight_init=curvature_weight_init, gauge_sd=gauge_sd, sample_bg=sample_bg,
         p0=p0, compile_mode=compile_mode, propagate_dtype=propagate_dtype,
     )
 
     pyro.set_rng_seed(int(seed))
-
     if init_jitter and init_jitter > 0:
         g = torch.Generator(device="cpu").manual_seed(int(seed))
         noise = torch.randn(z0.numel(), generator=g, dtype=DTYPE).to(device)
         z0 = z0 + init_jitter * noise
 
-    # pyro minimises the potential ENERGY, so the potential_fn is -log_prob. The whole
-    # flat vector lives under one site name ("z"); draws come back keyed by it.
-    def potential_fn(params):
-        return -log_prob_func(params["z"])
-
-    kernel_kw = dict(
-        potential_fn=potential_fn, step_size=step_size, adapt_step_size=bool(adapt_step_size),
-        adapt_mass_matrix=True, full_mass=full_mass,
-        target_accept_prob=target_accept, jit_compile=jit_compile,
-    )
-    use_nuts = sampler.lower() == "nuts"
-    Kernel = NUTS if use_nuts else HMC
-    if inverse_mass_matrix is not None:
-        Kernel = _starting_from(Kernel, torch.as_tensor(inverse_mass_matrix, dtype=DTYPE,
-                                                        device=device))
-    if use_nuts:
-        kernel = Kernel(max_tree_depth=int(max_tree_depth), **kernel_kw)
-    else:
-        kernel = Kernel(num_steps=int(num_steps_per_sample), **kernel_kw)
-
-    mcmc = MCMC(
-        kernel, num_samples=int(num_samples), warmup_steps=int(warmup),
-        num_chains=1, initial_params={"z": z0}, disable_progbar=not verbose,
-    )
+    # pyro minimises the potential ENERGY, so it gets -log p. The whole flat vector lives
+    # under one site name ("z"); the draws come back keyed by it.
+    Kernel = (NUTS if inverse_mass_matrix is None else
+              _nuts_starting_from(torch.as_tensor(inverse_mass_matrix, dtype=DTYPE,
+                                                  device=device)))
+    kernel = Kernel(potential_fn=lambda params: -log_prob(params["z"]),
+                    step_size=step_size, adapt_step_size=bool(adapt_step_size),
+                    adapt_mass_matrix=True, full_mass=full_mass,
+                    target_accept_prob=target_accept, max_tree_depth=int(max_tree_depth),
+                    jit_compile=jit_compile)
+    mcmc = MCMC(kernel, num_samples=int(num_samples), warmup_steps=int(warmup),
+                num_chains=1, initial_params={"z": z0}, disable_progbar=not verbose)
     mcmc.run()
 
-    # get_samples returns only the post-warmup draws: [S, dim].
-    Z = mcmc.get_samples()["z"].detach().to(device)
-    npot, n_rates = info["npot"], info["n_sampled_rates"]
-
-    theta = Z[:, :npot]
-    # u = M @ theta is linear in theta, so one basis build covers every draw. (Calling the
-    # potential per draw would rebuild the spline basis each time -- same numbers, orders
-    # of magnitude slower.)
-    M = potential._basis(grid)                              # [G, K]
-    U = theta @ M.T                                         # [S, G]
-    U = U - U.mean(dim=1, keepdim=True)      # grid-mean-zero reporting gauge
-    D = Z[:, npot].exp()
-    rates = Z[:, npot + 1:npot + 1 + n_rates].exp()
-    if not sample_bg:                        # re-attach the frozen pair so rates is [S, 4]
+    Z = mcmc.get_samples()["z"].detach().to(device)      # post-warmup draws only: [S, dim]
+    K, n_rates = info["npot"], info["n_sampled_rates"]
+    theta = Z[:, :K]
+    # U = M @ theta is linear in theta, so one basis build covers every draw.
+    U = theta @ potential._basis(grid).T
+    U = U - U.mean(dim=1, keepdim=True)                  # grid-mean-zero reporting gauge
+    rates = Z[:, K + 1:K + 1 + n_rates].exp()
+    if not sample_bg:                                    # re-attach the frozen pair: [S, 4]
         bg = torch.tensor([float(rates_init.bg_g), float(rates_init.bg_r)],
                           dtype=rates.dtype, device=rates.device)
         rates = torch.cat([rates, bg.expand(rates.shape[0], 2)], dim=1)
-    i_w = info["i_log_weight"]
-    curvature_weight = None if i_w is None else Z[:, i_w].exp()
 
     # The kernel's final state survives pyro's cleanup. Divergences come from pyro's own
     # per-chain record; mcmc.diagnostics() would also compute ESS / R-hat, which needs >= 4 draws.
     M_final = next(iter(kernel.inverse_mass_matrix.values())).detach().to(device)
-    return PosteriorSamples(U=U, D=D, rates=rates, theta=theta, z=Z, grid=grid,
+    return PosteriorSamples(U=U, D=Z[:, K].exp(), rates=rates, theta=theta,
+                            curvature_weight=Z[:, -1].exp(), z=Z, grid=grid,
                             n_sampled_rates=n_rates, step_size=float(kernel.step_size),
                             inverse_mass_matrix=M_final,
-                            n_divergences=len(mcmc._diagnostics[0]["divergences"]),
-                            curvature_weight=curvature_weight)
+                            n_divergences=len(mcmc._diagnostics[0]["divergences"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -579,8 +422,8 @@ def sample_posterior(
 class MultiChainPosterior:
     """Several chains plus an arviz ``InferenceData`` with a real chain dimension.
 
-    ``.U/.D/.rates/.theta`` concatenate every chain's draws (for pooled plotting);
-    ``.summary()`` returns ``arviz.summary`` (R-hat / ESS)."""
+    ``.U/.D/.rates/.theta/.curvature_weight`` concatenate every chain's draws (for pooled
+    plotting); ``.summary()`` returns ``arviz.summary`` (R-hat / ESS)."""
 
     chains: list                 # list[PosteriorSamples]
     idata: object = None         # arviz.InferenceData (chain dim = num_chains)
@@ -600,6 +443,10 @@ class MultiChainPosterior:
     @property
     def theta(self):
         return torch.cat([c.theta for c in self.chains], 0)
+
+    @property
+    def curvature_weight(self):
+        return torch.cat([c.curvature_weight for c in self.chains], 0)
 
     @property
     def grid(self):
@@ -630,7 +477,7 @@ def _run_one_chain(payload):
 
 
 def sample_posterior_multi(
-    batch, grid, potential, C, R0, prior: PriorConfig | None, rates_init=None, *,
+    batch, grid, potential, C, R0, prior: PriorConfig, rates_init=None, *,
     num_chains=4, overdisperse=0.3, base_seed=0, n_parallel=1, verbose=True, **kwargs,
 ) -> MultiChainPosterior:
     """Run ``num_chains`` chains from over-dispersed starts for R-hat / ESS.
@@ -657,6 +504,7 @@ def sample_posterior_multi(
     later workers hit the on-disk cache instead of compiling again.
     """
     _require_spline(potential, "sample_posterior_multi")
+    _require_l2_curvature_prior(prior)
     kwargs.pop("init_jitter", None)   # controlled here via ``overdisperse``
     kwargs.pop("seed", None)
 

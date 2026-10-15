@@ -193,31 +193,16 @@ def test_weight_validation():
 
 
 # --------------------------------------------------------------------------- #
-# 5. the sampler treats prior=None exactly as the fit does: pure MLE
+# 5. the sampler is the exception: it samples the curvature weight, so it needs one
 # --------------------------------------------------------------------------- #
-def test_sampler_accepts_prior_none_as_pure_mle():
-    """``prior=None`` is MLE for the sampler too -- it targets ``fit``'s objective.
+def test_sampler_refuses_prior_none():
+    """``prior=None`` is MLE for the fit, but the sampler samples the curvature prior's
+    weight and so needs an L2 curvature prior to weigh.
 
-    This file once asserted the opposite: the sampler used to reject ``prior=None`` and
-    demand a proper GP prior. The GP prior went in 0.3.0 and the sampler was rewritten in
-    0.4.0 to stop inventing prior terms of its own, so the target is now exactly
-    ``-(neg_log_posterior + gauge_penalty)`` whatever the prior is -- including nothing.
+    History: before 0.3.0 the sampler rejected ``prior=None`` for want of a GP prior; from
+    0.4.0 to 0.5.3 it accepted it as pure MLE; since 0.5.4 it samples the weight.
     """
     grid, pot, consts, C, rates, D, ipt, colors, mask = _setup()
-    batch = _Batch(ipt, colors, mask)
-    gauge_sd = 0.8
-
-    with pytest.warns(RuntimeWarning, match="no prior at all"):
-        logp, z0, info = build_log_prob(batch, grid, pot, C, consts.R0, None, rates,
-                                        D_init=10.0, gauge_sd=gauge_sd)
-
-    npot = info["npot"]
-    theta, D_z = z0[:npot], z0[npot].exp()
-    r = z0[npot + 1:npot + 1 + info["n_sampled_rates"]].exp()
-    with torch.no_grad():
-        pot.theta.copy_(theta)
-    ll = marginal_loglik_batch(ipt, colors, mask, pot, D_z,
-                               dfl.EffectiveRates(r[0], r[1], r[2], r[3]),
-                               grid, C, consts.R0)
-    want = -(-ll + gauge_penalty(pot, grid, gauge_sd))     # no prior term at all
-    assert float(logp(z0)) == pytest.approx(float(want), rel=1e-12)
+    with pytest.raises(ValueError, match="L2 curvature prior"):
+        build_log_prob(_Batch(ipt, colors, mask), grid, pot, C, consts.R0, None, rates,
+                       D_init=10.0)

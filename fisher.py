@@ -342,7 +342,7 @@ def _psd_inverse(M, rtol):
 # --------------------------------------------------------------------------- #
 class _PriorModule(torch.nn.Module):
     """Wrap the potential so ``functional_call`` can swap ``theta`` for the whole
-    ``prior_penalty`` evaluation (mirrors ``sample._NLPModule``)."""
+    ``prior_penalty`` evaluation."""
 
     def __init__(self, potential):
         super().__init__()

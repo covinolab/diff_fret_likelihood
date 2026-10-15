@@ -1,9 +1,10 @@
-"""HMC posterior sampler: the target identity, warm starts, chains, a sampled curvature weight.
+"""NUTS posterior sampler: the target, warm starts, chains, the sampled curvature weight.
 
-The load-bearing test here is ``test_target_is_fit_objective``: the sampler's whole
-contract is that its target density is ``infer.fit``'s objective negated, so that a chain
-and a fit run on the same ``prior``/``gauge_sd`` describe the same posterior. Everything
-else is about the warm starts and the plumbing around it.
+The load-bearing test here is ``test_target_is_fit_objective_plus_normaliser``: at a fixed
+weight ``w = e^u`` the sampler's target is ``infer.fit``'s objective at that weight,
+negated, plus the curvature prior's normalising term ``(K-2)/2 u``, so that a chain and a
+fit run on the same ``prior``/``gauge_sd`` describe the same posterior. Everything else is
+about the warm starts and the plumbing around it.
 
 Kept tiny (few traces, n_knots=5, a handful of HMC steps) so it runs in seconds.
 """
@@ -11,6 +12,7 @@ Kept tiny (few traces, n_knots=5, a handful of HMC steps) so it runs in seconds.
 import copy
 import math
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
@@ -62,10 +64,11 @@ def _build(s, prior="default", **kw):
 
 
 # --------------------------------------------------------------------------- #
-# the target IS infer.fit's objective
+# the target IS infer.fit's objective at w = e^u, plus the normalising term
 # --------------------------------------------------------------------------- #
 def _fit_objective(s, prior, z, npot, n_rates, gauge_sd):
-    """``infer.fit``'s ``closure_value()``, evaluated at the params encoded in ``z``."""
+    """``infer.fit``'s ``closure_value()`` at the params encoded in ``z`` (its last entry,
+    ln w, is not read: the weight is ``prior.curvature_weight``)."""
     pot = copy.deepcopy(s["pot"])
     with torch.no_grad():
         pot.theta.copy_(z[:npot])
@@ -79,36 +82,35 @@ def _fit_objective(s, prior, z, npot, n_rates, gauge_sd):
 
 
 @pytest.mark.parametrize("name,prior", [
-    ("none",          None),
-    ("bare",          dfl.PriorConfig()),
-    ("curvature_l2",  dfl.PriorConfig(curvature_weight=0.05)),
-    ("curvature_l1",  dfl.PriorConfig(curvature_weight=0.05, curvature_norm="l1")),
-    ("bg",            dfl.PriorConfig(**BG_PRIOR)),
+    ("curvature",     dfl.PriorConfig(curvature_weight=0.05)),
     ("curvature_bg",  dfl.PriorConfig(curvature_weight=0.05, **BG_PRIOR)),
 ])
-def test_target_is_fit_objective(name, prior):
-    """log_prob(z) == -(neg_log_posterior + gauge_penalty) -- the sampler's contract.
+def test_target_is_fit_objective_plus_normaliser(name, prior):
+    """log_prob(z) == -(neg_log_posterior + gauge_penalty at w = e^u) + (K-2)/2 u.
 
-    Checked away from z0 as well: an identity that only held at the initial point would
-    say nothing about the density the chain actually explores.
+    Checked away from z0 as well, with ln w moved too: an identity that only held at the
+    initial point would say nothing about the density the chain actually explores.
     """
     s = _setup()
     gsd = 0.7
     logp, z0, info = _build(s, prior, D_init=2.0, gauge_sd=gsd)
     npot, n_rates = info["npot"], info["n_sampled_rates"]
+    K = s["pot"].theta.numel()
 
-    # guard against a vacuous check: every prior except the two prior-free ones must
-    # actually move the objective, or this test would pass on a sampler that ignored it.
-    base = _fit_objective(s, None, z0, npot, n_rates, gsd)
-    if name not in ("none", "bare"):
-        assert abs(_fit_objective(s, prior, z0, npot, n_rates, gsd) - base) > 1e-9
+    # guard against a vacuous check: the weight must actually move the objective
+    assert abs(_fit_objective(s, prior, z0, npot, n_rates, gsd)
+               - _fit_objective(s, replace(prior, curvature_weight=1.0), z0, npot, n_rates,
+                                gsd)) > 1e-6
 
     for k in range(4):
         g = torch.Generator().manual_seed(k)
         z = z0 + (0.0 if k == 0 else
                   0.25 * torch.randn(z0.numel(), generator=g, dtype=torch.float64))
+        u = float(z[-1])
         got = float(logp(z.clone().requires_grad_(True)))
-        want = -_fit_objective(s, prior, z, npot, n_rates, gsd)
+        want = (-_fit_objective(s, replace(prior, curvature_weight=math.exp(u)), z, npot,
+                                n_rates, gsd)
+                + 0.5 * (K - 2) * u)
         assert math.isclose(got, want, rel_tol=1e-12), f"{name} @ draw {k}"
 
 
@@ -126,48 +128,50 @@ def test_background_prior_counted_once():
 
 
 # --------------------------------------------------------------------------- #
-# prior handling: no gate, one warning
+# prior handling: the weight is sampled, so there must be an L2 curvature prior
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("prior", [
     None,
-    dfl.PriorConfig(),
-    dfl.PriorConfig(curvature_weight=0.05),
-    dfl.PriorConfig(**BG_PRIOR),
+    dfl.PriorConfig(),                                              # no curvature term
+    dfl.PriorConfig(**BG_PRIOR),                                    # no curvature term
+    dfl.PriorConfig(curvature_weight=0.05, curvature_norm="l1"),    # other normaliser
 ])
-def test_accepts_any_prior(prior):
-    """Nothing is rejected -- prior=None is pure MLE here exactly as it is in fit."""
+def test_needs_a_positive_l2_curvature_prior(prior):
+    with pytest.raises(ValueError, match="L2 curvature prior"):
+        _build(_setup(), prior, D_init=2.0)
+
+
+def test_sample_posterior_refuses_before_the_warm_starts():
+    """A missing curvature prior must fail at once, not after a KDE scan and a MAP fit."""
     s = _setup()
-    logp, z0, _ = _build(s, prior, D_init=10.0)
-    assert torch.isfinite(logp(z0.clone().requires_grad_(True)))
+    theta_before = s["pot"].theta.detach().clone()
+    with pytest.raises(ValueError, match="L2 curvature prior"):
+        S.sample_posterior(s["batch"], s["grid"], s["pot"], s["C"], s["R0"], None,
+                           s["rates"], verbose=False)
+    assert torch.equal(s["pot"].theta.detach(), theta_before)
 
 
-def test_warns_only_when_there_is_no_prior():
-    s = _setup()
-    for prior in (None, dfl.PriorConfig()):
-        with pytest.warns(RuntimeWarning, match="no prior at all"):
-            S.build_log_prob(s["batch"], s["grid"], s["pot"], s["C"], s["R0"], prior,
-                             s["rates"], D_init=10.0)
-    for prior in (dfl.PriorConfig(curvature_weight=0.05), dfl.PriorConfig(**BG_PRIOR)):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")      # any warning fails the test
-            S.build_log_prob(s["batch"], s["grid"], s["pot"], s["C"], s["R0"], prior,
-                             s["rates"], D_init=10.0)
+def test_start_weight_must_be_positive():
+    with pytest.raises(ValueError, match="positive"):
+        _build(_setup(), D_init=2.0, curvature_weight_init=0.0)
 
 
-def test_l1_curvature_warns():
-    s = _setup()
-    prior = dfl.PriorConfig(curvature_weight=0.05, curvature_norm="l1")
-    with pytest.warns(RuntimeWarning, match="not differentiable"):
-        S.build_log_prob(s["batch"], s["grid"], s["pot"], s["C"], s["R0"], prior,
-                         s["rates"], D_init=10.0)
-
-
-@pytest.mark.parametrize("dead", ["rate_sd", "logD_sd"])
+@pytest.mark.parametrize("dead", ["rate_sd", "logD_sd", "curvature_hyperprior"])
 def test_removed_kwargs_are_gone(dead):
-    """Both were sampler-invented priors with no counterpart in fit; removed, not shimmed."""
+    """Sampler-invented priors with no counterpart in fit (rate_sd, logD_sd) and the normal
+    hyperprior on ln w, now flat: removed, not shimmed."""
     s = _setup()
     with pytest.raises(TypeError):
         _build(s, D_init=10.0, **{dead: 1.0})
+
+
+@pytest.mark.parametrize("dead", ["sampler", "num_steps_per_sample", "curvature_hyperprior"])
+def test_removed_sampler_options_are_gone(dead):
+    """NUTS only, and no hyperprior: the plain-HMC options are gone with it."""
+    s = _setup()
+    with pytest.raises(TypeError):
+        S.sample_posterior(s["batch"], s["grid"], s["pot"], s["C"], s["R0"], s["prior"],
+                           s["rates"], **{dead: 1})
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +186,7 @@ def test_log_prob_grad_flows():
     (g,) = torch.autograd.grad(lp, z)
     assert g.shape == z.shape and torch.isfinite(g).all()
     assert float(g.abs().sum()) > 0.0
-    assert info["dim"] == z0.numel() == info["npot"] + 1 + S.N_RATES
+    assert info["dim"] == z0.numel() == info["npot"] + 1 + S.N_RATES + 1
 
 
 def test_log_prob_leaves_module_intact():
@@ -194,14 +198,22 @@ def test_log_prob_leaves_module_intact():
     assert torch.allclose(s["pot"].theta.detach(), theta_before)
 
 
-def test_flatten_unflatten_roundtrip():
+def test_z0_is_the_start_in_log_space():
+    """z0 = [theta | ln D | ln rates | ln w], the weight by default the MAP's."""
     s = _setup()
-    z0 = S._flatten_init(s["pot"], 10.0, s["rates"])
-    specs = S._param_specs(s["pot"])
-    npot = sum(n for _, _, n in specs)
-    assert torch.allclose(S._unflatten(z0[:npot], specs)["theta"], s["pot"].theta.detach())
-    assert torch.allclose(z0[npot].exp(), torch.tensor(10.0, dtype=torch.float64))
-    assert torch.allclose(z0[npot + 1].exp(), s["rates"].a_g)
+    _, z0, info = _build(s, D_init=10.0)
+    K = info["npot"]
+    assert torch.equal(z0[:K], s["pot"].theta.detach())
+    assert math.isclose(float(z0[K].exp()), 10.0, rel_tol=1e-12)
+    r = s["rates"]
+    for k, v in enumerate((r.a_g, r.a_r, r.bg_g, r.bg_r)):
+        assert math.isclose(float(z0[K + 1 + k].exp()), float(v), rel_tol=1e-12)
+    assert info["i_log_weight"] == z0.numel() - 1 == info["dim"] - 1
+    assert math.isclose(float(z0[-1].exp()), s["prior"].curvature_weight, rel_tol=1e-12)
+
+    _, z1, _ = _build(s, D_init=10.0, curvature_weight_init=3e-3)
+    assert torch.equal(z1[:-1], z0[:-1])
+    assert math.isclose(float(z1[-1].exp()), 3e-3, rel_tol=1e-12)
 
 
 def test_sample_bg_false_drops_the_backgrounds_from_z():
@@ -209,7 +221,7 @@ def test_sample_bg_false_drops_the_backgrounds_from_z():
     logp, z0, info = _build(s, D_init=10.0, sample_bg=False)
     assert info["n_sampled_rates"] == 2
     assert info["rate_names"] == ("a_g", "a_r")
-    assert z0.numel() == info["npot"] + 1 + 2
+    assert z0.numel() == info["npot"] + 1 + 2 + 1
     # the frozen pair still reaches the likelihood: the target stays finite and moves
     assert torch.isfinite(logp(z0.clone().requires_grad_(True)))
 
@@ -295,8 +307,7 @@ def test_gauge_sd_reaches_the_map_warm_start():
                 s["batch"], s["grid"], pot, s["C"], s["R0"], s["prior"], s["rates"],
                 kde_warmstart=False, map_warmstart=True, map_optim=optim,
                 fit_rates=False, gauge_sd=gauge_sd, D_init=5.0, num_samples=1,
-                warmup=1, num_steps_per_sample=1, step_size=1e-6, sampler="hmc",
-                verbose=False)
+                warmup=1, max_tree_depth=1, step_size=1e-6, verbose=False)
         return abs(float(pot.theta.mean()))
 
     offsets = [fitted_offset(g) for g in (0.02, 0.2, 2.0)]
@@ -314,8 +325,8 @@ def _chain(s, **kw):
         warnings.simplefilter("ignore")
         return S.sample_posterior(
             s["batch"], s["grid"], s["pot"], s["C"], s["R0"], s["prior"], s["rates"],
-            kde_warmstart=False, num_samples=4, warmup=2, num_steps_per_sample=2,
-            step_size=0.002, sampler="hmc", verbose=False, **kw)
+            kde_warmstart=False, num_samples=4, warmup=2, max_tree_depth=2,
+            step_size=0.002, verbose=False, **kw)
 
 
 def test_short_chain_smoke():
@@ -324,9 +335,9 @@ def test_short_chain_smoke():
     G, Sn = s["grid"].shape[0], ps.U.shape[0]
     assert Sn >= 1
     assert ps.U.shape == (Sn, G) and ps.D.shape == (Sn,)
-    assert ps.rates.shape == (Sn, S.N_RATES)
+    assert ps.rates.shape == (Sn, S.N_RATES) and ps.curvature_weight.shape == (Sn,)
     assert torch.isfinite(ps.U).all() and torch.isfinite(ps.D).all()
-    assert (ps.D > 0).all() and (ps.rates > 0).all()
+    assert (ps.D > 0).all() and (ps.rates > 0).all() and (ps.curvature_weight > 0).all()
     assert torch.allclose(ps.U.mean(dim=1), torch.zeros(Sn, dtype=torch.float64),
                           atol=1e-9)
     band = ps.U_band((0.1, 0.9))
@@ -356,7 +367,7 @@ def test_fit_bg_false_freezes_the_backgrounds():
     assert float(ps.rates[0, 2]) == pytest.approx(float(s["rates"].bg_g))
     assert float(ps.rates[0, 3]) == pytest.approx(float(s["rates"].bg_r))
     assert ps.n_sampled_rates == 2          # only a_g/a_r were in z
-    assert ps.z.shape[1] == ps.theta.shape[1] + 1 + 2
+    assert ps.z.shape[1] == ps.theta.shape[1] + 1 + 2 + 1
 
 
 def test_fit_rates_does_not_reach_the_chain():
@@ -368,7 +379,7 @@ def test_fit_rates_does_not_reach_the_chain():
     s = _setup()
     ps = _chain(s, map_warmstart=False, fit_rates=False, fit_bg=True)
     assert ps.n_sampled_rates == S.N_RATES
-    assert ps.z.shape[1] == ps.theta.shape[1] + 1 + S.N_RATES
+    assert ps.z.shape[1] == ps.theta.shape[1] + 1 + S.N_RATES + 1
 
 
 def test_chain_runs_with_map_warmstart():
@@ -384,7 +395,7 @@ def test_to_arviz():
     s = _setup()
     idata = _chain(s, map_warmstart=False).to_arviz()
     assert "logD" in idata.posterior and "theta_0" in idata.posterior
-    assert "log_a_g" in idata.posterior
+    assert "log_a_g" in idata.posterior and "log_curvature_weight" in idata.posterior
 
 
 def test_arviz_skips_frozen_rates():
@@ -406,11 +417,12 @@ def test_multi_chain_rhat():
             s["batch"], s["grid"], s["pot"], s["C"], s["R0"], s["prior"], s["rates"],
             num_chains=2, overdisperse=0.2, base_seed=0, kde_warmstart=False,
             map_warmstart=False, D_init=10.0, num_samples=6, warmup=3,
-            num_steps_per_sample=2, step_size=0.01, sampler="hmc", verbose=False)
+            max_tree_depth=2, step_size=0.01, verbose=False)
     assert len(mc.chains) == 2
     assert mc.idata is not None and mc.idata.posterior.sizes["chain"] == 2
     assert "r_hat" in mc.summary().columns
     assert mc.U.shape[0] == mc.chains[0].U.shape[0] + mc.chains[1].U.shape[0]
+    assert mc.curvature_weight.shape == mc.D.shape
 
 
 def _multi(s, **kw):
@@ -421,7 +433,7 @@ def _multi(s, **kw):
             s["batch"], s["grid"], s["pot"], s["C"], s["R0"], s["prior"], s["rates"],
             num_chains=2, overdisperse=0.2, base_seed=0, kde_warmstart=False,
             map_warmstart=False, D_init=10.0, num_samples=5, warmup=2,
-            num_steps_per_sample=2, step_size=0.01, sampler="hmc", verbose=False, **kw)
+            max_tree_depth=2, step_size=0.01, verbose=False, **kw)
 
 
 def test_parallel_chains_match_sequential():
@@ -447,7 +459,7 @@ def test_parallel_returns_the_same_shape_of_result():
     seq, par = _multi(s, n_parallel=1), _multi(s, n_parallel=9)   # 9 -> clamped to 2
     assert len(par.chains) == 2
     for a, b in zip(seq.chains, par.chains):
-        for name in ("U", "D", "rates", "theta", "z", "grid"):
+        for name in ("U", "D", "rates", "theta", "curvature_weight", "z", "grid"):
             x, y = getattr(a, name), getattr(b, name)
             assert x.shape == y.shape and x.dtype == y.dtype and x.device == y.device, name
         assert a.n_sampled_rates == b.n_sampled_rates
@@ -462,8 +474,7 @@ def _run(s, **kw):
     """A short chain whose every option can be overridden (``_chain`` fixes some)."""
     pytest.importorskip("pyro")
     opts = dict(kde_warmstart=False, map_warmstart=False, D_init=10.0, num_samples=4,
-                warmup=2, num_steps_per_sample=2, step_size=0.002, sampler="hmc",
-                verbose=False)
+                warmup=2, max_tree_depth=2, step_size=0.002, verbose=False)
     opts.update(kw)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -480,62 +491,41 @@ def test_chain_reports_its_final_kernel():
 
 
 def test_fixed_step_size_is_kept():
-    ps = _run(_setup(), sampler="nuts", max_tree_depth=2, warmup=0, num_samples=3,
-              step_size=0.0123, adapt_step_size=False)
+    ps = _run(_setup(), warmup=0, num_samples=3, step_size=0.0123, adapt_step_size=False)
     assert ps.step_size == 0.0123 and ps.z.shape[0] == 3
 
 
 def test_starting_matrix_is_used_and_kept_without_warmup():
     """With ``warmup=0`` the matrix passed in is kept: nothing adapts it."""
     s = _setup()
-    dim = s["pot"].theta.numel() + 1 + S.N_RATES
+    dim = s["pot"].theta.numel() + 1 + S.N_RATES + 1
     A = torch.randn(dim, dim, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
     M = 0.09 * (A @ A.T / dim + torch.eye(dim, dtype=torch.float64))
     ps = _run(s, warmup=0, adapt_step_size=False, inverse_mass_matrix=M)
     assert torch.allclose(ps.inverse_mass_matrix.cpu(), M)
 
 
+def test_curvature_weight_init_reaches_the_chain():
+    """Continuing a chain: the weight starts where it is told to, not at the prior's."""
+    ps = _run(_setup(), warmup=0, num_samples=1, step_size=1e-9, adapt_step_size=False,
+              max_tree_depth=1, curvature_weight_init=7e-3)
+    assert math.isclose(float(ps.curvature_weight[0]), 7e-3, rel_tol=1e-6)
+
+
 # --------------------------------------------------------------------------- #
-# a sampled curvature weight (hierarchical curvature prior)
+# the sampled curvature weight
 # --------------------------------------------------------------------------- #
-HYPER = (math.log(1e-3), 2.3)       # mean and sd of the normal prior on ln w
-
-
-@pytest.mark.parametrize("prior", [
-    dfl.PriorConfig(curvature_weight=0.05),
-    dfl.PriorConfig(curvature_weight=0.05, **BG_PRIOR),     # the bg prior must stay in
-])
-def test_sampled_weight_target_is_the_fixed_target_plus_a_constant(prior):
-    """At ln w = ln w0 the hierarchical target differs from the fixed-weight one only by
-    the normalising term and the hyperprior: a constant, the same for every theta."""
-    s = _setup()
-    w0 = prior.curvature_weight
-    lp_fix, z0, _ = _build(s, prior, D_init=2.0)
-    lp_hier, z0_h, info = _build(s, prior, D_init=2.0, curvature_hyperprior=HYPER)
-    i = info["i_log_weight"]
-    assert i == z0.numel() and z0_h.numel() == z0.numel() + 1
-    assert torch.equal(z0_h[:i], z0) and math.isclose(float(z0_h[i]), math.log(w0))
-
-    K, (m, sd) = s["pot"].theta.numel(), HYPER
-    const = 0.5 * (K - 2) * math.log(w0) - 0.5 * ((math.log(w0) - m) / sd) ** 2
-    for k in range(3):
-        g = torch.Generator().manual_seed(k)
-        z = z0 + 0.25 * torch.randn(z0.numel(), generator=g, dtype=torch.float64)
-        diff = float(lp_hier(torch.cat([z, z0_h[i:]]))) - float(lp_fix(z))
-        assert math.isclose(diff, const, rel_tol=1e-10, abs_tol=1e-10), f"draw {k}"
-
-
-def test_sampled_weight_gradient_has_the_normalising_term():
-    """d log_prob / d ln w = (K-2)/2 - w R(theta) - (ln w - m)/s^2.
+def test_gradient_in_ln_w_has_the_normalising_term():
+    """d log_prob / d ln w = (K-2)/2 - w R(theta), with a flat prior on ln w.
 
     The (K-2)/2 is the curvature prior's normalising term; without it the chain would send
     the weight to zero.
     """
     from diff_fret_likelihood.objective import curvature_penalty_spline
     s = _setup()
-    lp, z0, info = _build(s, D_init=2.0, curvature_hyperprior=HYPER)
+    lp, z0, info = _build(s, D_init=2.0)
     i, npot = info["i_log_weight"], info["npot"]
-    K, (m, sd) = s["pot"].theta.numel(), HYPER
+    K = s["pot"].theta.numel()
     R = float(curvature_penalty_spline(z0[:npot], s["pot"].knots_x))
     assert R > 0                                    # CURVED_THETA: the term is active
     for u in (math.log(1e-4), math.log(0.05), math.log(3.0)):
@@ -543,27 +533,13 @@ def test_sampled_weight_gradient_has_the_normalising_term():
         z[i] = u
         z.requires_grad_(True)
         (g,) = torch.autograd.grad(lp(z), z)
-        want = 0.5 * (K - 2) - math.exp(u) * R - (u - m) / sd ** 2
+        want = 0.5 * (K - 2) - math.exp(u) * R
         assert math.isclose(float(g[i]), want, rel_tol=1e-9, abs_tol=1e-9), u
 
 
-def test_sampled_weight_comes_back_with_the_draws():
-    s = _setup()
-    ps = _run(s, curvature_hyperprior=HYPER)
+def test_weight_comes_back_with_the_draws():
+    ps = _run(_setup())
     n = ps.z.shape[0]
     assert ps.z.shape[1] == ps.theta.shape[1] + 1 + S.N_RATES + 1
     assert ps.curvature_weight.shape == (n,) and (ps.curvature_weight > 0).all()
     assert torch.allclose(ps.curvature_weight, ps.z[:, -1].exp())
-    assert _run(_setup()).curvature_weight is None          # held fixed by default
-    pytest.importorskip("arviz")
-    assert "log_curvature_weight" in ps.to_arviz().posterior
-
-
-@pytest.mark.parametrize("prior", [
-    None,
-    dfl.PriorConfig(**BG_PRIOR),                                    # no curvature term
-    dfl.PriorConfig(curvature_weight=0.05, curvature_norm="l1"),    # other normaliser
-])
-def test_sampled_weight_needs_a_positive_l2_curvature_prior(prior):
-    with pytest.raises(ValueError, match="curvature_hyperprior"):
-        _build(_setup(), prior, D_init=2.0, curvature_hyperprior=HYPER)
